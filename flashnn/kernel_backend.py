@@ -1,0 +1,52 @@
+import os
+
+import torch
+import torch.nn
+
+use_triton = os.getenv("USE_TRITON_KERNELS", True)
+
+
+def get_use_triton():
+    return use_triton
+
+
+def set_use_triton(v: bool):
+    global use_triton
+    use_triton = v
+
+
+def is_hip():
+    import torch
+
+    return torch.version.hip is not None
+
+
+THREADS_PER_WARP = 64 if is_hip() else 32
+
+
+class BackendKernel(torch.nn.Module):
+    """
+    This class is used to implement a kernel for multiple backends.
+    The kernel implementation is defined in the method named _{backend}_impl.
+    The method _{backend}_impl should be implemented in the subclass of BackendKernel.
+    Right now the backend can be "triton" and "torch".
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.backends = ["triton", "torch"]
+
+    def _triton_impl(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def _torch_impl(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def forward(self, *args, **kwargs):
+        for backend in self.backends:
+            if backend == "triton" and not get_use_triton():
+                continue
+            method = getattr(self, f"_{backend}_impl")
+            if method.__func__ != getattr(BackendKernel, f"_{backend}_impl"):
+                return method(*args, **kwargs)
+        raise ValueError("No valid backend found.")
