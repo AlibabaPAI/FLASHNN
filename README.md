@@ -10,7 +10,7 @@ By harnessing the power of Triton, FLASHNN is engineered to seamlessly integrate
 
 - **Comprehensive Support for Attention Kernels**: FLASHNN offers extensive support for various types of attention mechanisms, enabling it to handle a wide array of LLM architectures with ease. 
 - **Multiple Quantization Methods**: FLASHNN incorporates multiple quantization techniques (int8, int4) aimed at optimizing both the computational overhead and the memory footprint of LLMs, making it easier to deploy LLMs in resource-constrained environments.
-- **Runtime Overhead**：The primary contributor to the performance discrepancy observed with Triton kernels is the runtime overhead. To address this, we have implemented an ahead-of-time kernel cache for Triton kernels, which significantly mitigates this overhead.
+- **Low Runtime Overhead**：The primary contributor to the performance discrepancy observed with Triton kernels is the runtime overhead. To address this, we have implemented an ahead-of-time kernel cache for Triton kernels, which significantly mitigates this overhead.
 - **Production-Ready Performance**: FLASHNN is meticulously optimized for production scenarios, which delivers state-of-art performance that meets the demanding requirements of real-world applications.
 - **Smooth Portability on Multiple Hardware**: Facilitated by the inherent design of the Triton language, FLASHNN simplifying the process of adapting LLM serving solutions to diverse computing environments.
 
