@@ -4,13 +4,7 @@ import triton
 import triton.language as tl
 import flashnn
 
-try:
-    import bladnn
-
-    HAS_BLADNN = True
-except ImportError:
-    HAS_BLADNN = False
-  
+ 
 configs = []
 for N, K in [
     (13312, 8896),
@@ -50,10 +44,6 @@ def benchmark(M, N, K, provider):
         triton_gemm_a8w8 = flashnn.GemmA8W8(out_ty=torch.half)
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: triton_gemm_a8w8(a, b, alpha_row, alpha_col), rep=100, quantiles=quantiles
-        )
-    if provider == 'bladnn':
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: bladnn.gemm_a8w8(a, b, alpha_row, alpha_col), rep=100, quantiles=quantiles
         )
     if provider == 'torch':
         flashnn.set_use_triton(False)
