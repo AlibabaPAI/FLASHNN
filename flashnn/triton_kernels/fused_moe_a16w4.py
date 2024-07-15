@@ -1,11 +1,8 @@
-# Copyright 2024 The FLASHNN Authors. All rights reserved.
-#
-# This source code is licensed under the Apache 2.0 license found in the
-# LICENSE file in the root directory of this source tree.
 import torch
 import triton
 import triton.language as tl
-from blade_llm.module.triton.triton_utils import compile_and_cache_kernels
+
+from flashnn.triton_kernels.triton_utils import compile_and_cache_kernels
 
 
 @triton.jit
@@ -78,26 +75,16 @@ def _fused_moe_kernel_a16w4_perchannel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    a_ptrs = A + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    b_ptrs = (
-        B
-        + off_experts * stride_be
-        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    )
+    b_ptrs = B + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     if add_zero_points:
         offs_zero_points = pid_n * BLOCK_SIZE_N * 2 + tl.arange(0, 2 * BLOCK_SIZE_N)
-        zero_points_ptrs = (
-            zero_points_ptr + off_experts * stride_zero_points_e + offs_zero_points
-        )
+        zero_points_ptrs = zero_points_ptr + off_experts * stride_zero_points_e + offs_zero_points
         _ZERO_POINT0 = tl.zeros([1], dtype=zero_points_ptr.dtype.element_ty)
-        zero_points_vals = tl.load(
-            zero_points_ptrs, mask=offs_zero_points < 2 * N, other=_ZERO_POINT0
-        )
+        zero_points_vals = tl.load(zero_points_ptrs, mask=offs_zero_points < 2 * N, other=_ZERO_POINT0)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -106,14 +93,8 @@ def _fused_moe_kernel_a16w4_perchannel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N * 2), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=_A0,
-        )
-        b_int4_two = tl.load(
-            b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=_B0
-        )
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=_A0)
+        b_int4_two = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=_B0)
 
         b_int4_l = b_int4_two.__lshift__(4).to(tl.int8).__rshift__(4)
         b_int4_h = b_int4_two.__rshift__(4)
@@ -130,9 +111,7 @@ def _fused_moe_kernel_a16w4_perchannel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     offs_scale = pid_n * BLOCK_SIZE_N * 2 + tl.arange(0, BLOCK_SIZE_N * 2)
-    scale_ptrs = (
-        scale_b_ptr + off_experts * stride_scale_be + offs_scale * stride_scale_bn
-    )
+    scale_ptrs = scale_b_ptr + off_experts * stride_scale_be + offs_scale * stride_scale_bn
     _SCALE0 = tl.zeros([1], dtype=scale_b_ptr.dtype.element_ty)
     scales = tl.load(scale_ptrs, mask=offs_scale < 2 * N, other=_SCALE0)
     accumulator *= scales[None, :]
@@ -217,16 +196,10 @@ def _fused_moe_kernel_a16w4_subchannel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    a_ptrs = A + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    b_ptrs = (
-        B
-        + off_experts * stride_be
-        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    )
+    b_ptrs = B + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -235,14 +208,8 @@ def _fused_moe_kernel_a16w4_subchannel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N * 2), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=_A0,
-        )
-        b_int4_two = tl.load(
-            b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=_B0
-        )  # [K x N]
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=_A0)
+        b_int4_two = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=_B0)  # [K x N]
 
         b_int4_l = b_int4_two.__lshift__(4).to(tl.int8).__rshift__(4)
         b_int4_h = b_int4_two.__rshift__(4)
@@ -250,28 +217,16 @@ def _fused_moe_kernel_a16w4_subchannel(
 
         # dequantize weight
         if add_zero_points:
-            offs_zp_n = (pid_n * BLOCK_SIZE_N * 2 + tl.arange(0, 2 * BLOCK_SIZE_N)) % (
-                2 * N
-            )
+            offs_zp_n = (pid_n * BLOCK_SIZE_N * 2 + tl.arange(0, 2 * BLOCK_SIZE_N)) % (2 * N)
             _ZERO_POINT0 = tl.zeros([1], dtype=zero_points_ptr.dtype.element_ty)
             offs_zp_k = tl.arange(0, 1)
-            zp_ptrs = (
-                zero_points_ptr
-                + off_experts * stride_zero_points_e
-                + offs_zp_n * stride_zero_points_n
-                + k
-            )
+            zp_ptrs = zero_points_ptr + off_experts * stride_zero_points_e + offs_zp_n * stride_zero_points_n + k
             zero_points_vals = tl.load(zp_ptrs)
             b = b - zero_points_vals
 
         offs_scale_n = pid_n * BLOCK_SIZE_N * 2 + tl.arange(0, 2 * BLOCK_SIZE_N)
         _SCALE0 = tl.zeros([1], dtype=scale_b_ptr.dtype.element_ty)
-        scale_b_ptrs = (
-            scale_b_ptr
-            + off_experts * stride_scale_be
-            + offs_scale_n * stride_scale_bn
-            + k
-        )
+        scale_b_ptrs = scale_b_ptr + off_experts * stride_scale_be + offs_scale_n * stride_scale_bn + k
         scales_val = tl.load(scale_b_ptrs, mask=offs_scale_n < 2 * N, other=_SCALE0)
         b = b * scales_val[None, :]
 
@@ -341,8 +296,8 @@ def fused_moe_a16w4_forward(
     is_perchannel = scale_b.dim() == 2  # (E, N)
 
     grid = (
-        triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], config["BLOCK_SIZE_N"]),
+        triton.cdiv(sorted_token_ids.shape[0], config['BLOCK_SIZE_M'])
+        * triton.cdiv(B.shape[1], config['BLOCK_SIZE_N']),
         1,
         1,
     )
@@ -374,16 +329,10 @@ def fused_moe_a16w4_forward(
     ]
 
     kwargs += (
-        [1, 1, 1]
-        if not add_zero_points
-        else [zero_points.stride(0), zero_points.stride(1), zero_points.stride(-1)]
+        [1, 1, 1] if not add_zero_points else [zero_points.stride(0), zero_points.stride(1), zero_points.stride(-1)]
     )
 
-    const_kwargs = {
-        "MUL_ROUTED_WEIGHT": mul_routed_weight,
-        "top_k": top_k,
-        "num_warps": 4,
-    }
+    const_kwargs = {"MUL_ROUTED_WEIGHT": mul_routed_weight, "top_k": top_k, "num_warps": 4}
 
     if add_zero_points:
         const_kwargs.update({"add_zero_points": True})
@@ -392,21 +341,15 @@ def fused_moe_a16w4_forward(
 
     if not is_perchannel:
         k_per_scale = B.shape[-1] // scale_b.shape[-1]
-        config["BLOCK_SIZE_K"] = k_per_scale
+        config['BLOCK_SIZE_K'] = k_per_scale
 
     const_kwargs.update(config)
 
-    method_name = "fuse_moe_a16w4_" + "_".join(
-        str(value) for value in const_kwargs.values()
-    )
+    method_name = "fuse_moe_a16w4_" + '_'.join(str(value) for value in const_kwargs.values())
 
     if is_perchannel:
-        fuse_moe_a16w4 = triton.autotune(configs=config, key=["M", "N", "K"])(
-            _fused_moe_kernel_a16w4_perchannel
-        )
+        fuse_moe_a16w4 = _fused_moe_kernel_a16w4_perchannel
     else:
-        fuse_moe_a16w4 = triton.autotune(configs=config, key=["M", "N", "K"])(
-            _fused_moe_kernel_a16w4_subchannel
-        )
+        fuse_moe_a16w4 = _fused_moe_kernel_a16w4_subchannel
 
-    fuse_moe_a16w4[grid](*kwargs)
+    compile_and_cache_kernels(fuse_moe_a16w4, method_name, grid, kwargs, const_kwargs)

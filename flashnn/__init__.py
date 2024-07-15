@@ -11,3 +11,6 @@ from .quant_gemm import DynamicQuantize, GemmA8W8, GemmWeightOnly
 from .rotary_embedding import RotaryEmbedding
 from .triton_kernels.paged_attn_v2 import triton_paged_attention_v2
 from .triton_kernels.paged_attn import paged_attention, paged_attn_w_mma, paged_attn_wo_mma
+from .triton_kernels.fused_moe_a8w8 import fused_moe_a8w8_forward
+from .triton_kernels.fused_moe_a16w4 import fused_moe_a16w4_forward
+from .triton_kernels.fused_moe_fp16 import fused_moe_fp16_forward

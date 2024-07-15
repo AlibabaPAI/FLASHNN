@@ -1,10 +1,8 @@
-# Copyright 2024 The FLASHNN Authors. All rights reserved.
-#
-# This source code is licensed under the Apache 2.0 license found in the
-# LICENSE file in the root directory of this source tree.
 import torch
 import triton
 import triton.language as tl
+
+from flashnn.triton_kernels.triton_utils import compile_and_cache_kernels
 
 
 @triton.jit
@@ -68,16 +66,10 @@ def _fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    a_ptrs = A + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    b_ptrs = (
-        B
-        + off_experts * stride_be
-        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    )
+    b_ptrs = B + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -89,11 +81,7 @@ def _fused_moe_kernel(
     _B0 = tl.zeros([1, 1], dtype=b_ptrs.dtype.element_ty)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=_A0,
-        )
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=_A0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=_B0)
         # We accumulate along the K dimension.
         accumulator += tl.dot(a, b)
@@ -114,7 +102,7 @@ def _fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def fused_moe_forward(
+def fused_moe_fp16_forward(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -145,8 +133,8 @@ def fused_moe_forward(
     assert B.shape[1] % 16 == 0 and B.shape[2] % 16 == 0
 
     grid = (
-        triton.cdiv(sorted_token_ids.shape[0], config["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], config["BLOCK_SIZE_N"]),
+        triton.cdiv(sorted_token_ids.shape[0], config['BLOCK_SIZE_M'])
+        * triton.cdiv(B.shape[1], config['BLOCK_SIZE_N']),
         1,
         1,
     )
@@ -180,8 +168,5 @@ def fused_moe_forward(
 
     const_kwargs.update(config)
 
-    method_name = "fuse_moe_" + "_".join(str(value) for value in const_kwargs.values())
-    fused_moe_kernel = triton.autotune(configs=config, key=["M", "N", "K"])(
-        _fused_moe_kernel
-    )
-    fused_moe_kernel[grid](*kwargs)
+    method_name = "fuse_moe_" + '_'.join(str(value) for value in const_kwargs.values())
+    compile_and_cache_kernels(_fused_moe_kernel, method_name, grid, kwargs, const_kwargs)
