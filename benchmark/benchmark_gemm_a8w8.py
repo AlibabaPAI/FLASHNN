@@ -31,12 +31,12 @@ for N, K in [
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider):
     a = torch.randint(-128, 127, (M, K), dtype=torch.int8).cuda()
-    b = torch.randint(-128, 127, (N, K), dtype=torch.int8).cuda()
+    b = torch.randint(-128, 127, (N, K), dtype=torch.int8).cuda().T
     alpha_row = torch.rand([M, 1], dtype=torch.half).cuda()
     alpha_col = torch.rand([1, N], dtype=torch.half).cuda()
     quantiles = [0.5, 0.2, 0.8]
     M, K = a.shape
-    N, K = b.shape
+    K, N = b.shape
 
     if provider == 'triton':
         flashnn.set_use_triton(True)

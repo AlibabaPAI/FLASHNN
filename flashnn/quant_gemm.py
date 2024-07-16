@@ -94,7 +94,7 @@ class GemmA8W8(BackendKernel):
         return out
 
     def _torch_impl(self, a, b, alpha_row, alpha_col):
-        b = b.transpose(0, 1)
+        # b = b.transpose(0, 1)
         x = torch.matmul(a.to(torch.float32), b.to(torch.float32))
         scale = torch.matmul(
             torch.squeeze(alpha_row).flatten().unsqueeze(-1),
