@@ -1,3 +1,7 @@
+# Copyright 2024 The FLASHNN Authors. All rights reserved.
+#
+# This source code is licensed under the Apache 2.0 license found in the
+# LICENSE file in the root directory of this source tree.
 import torch
 import triton
 import triton.language as tl
@@ -23,7 +27,9 @@ def paged_attention(
     query_group_size = query.shape[1] // num_kv_heads
 
     assert head_size in (16, 32, 64, 128, 256, 512), f"head_size={head_size}"
-    assert query_group_size == 1 or kv_block_size >= 16, f"kv_block_size={kv_block_size}"
+    assert (
+        query_group_size == 1 or kv_block_size >= 16
+    ), f"kv_block_size={kv_block_size}"
     # query_group_size in (1, 2, 4, 8, 16, 32, 64, 128, 256)
     # assert query_group_size > 0 and query_group_size & (query_group_size-1) == 0, f"query_group_size={query_group_size}"
 
@@ -91,12 +97,14 @@ def paged_attn_wo_mma(
 
     with torch.cuda.device(device):
         shape_info = (num_seqs, num_q_heads, num_splits)
-        exp_sums = torch.empty(size=shape_info, dtype=torch.float32, device='cuda')
-        max_logits = torch.empty(size=shape_info, dtype=torch.float32, device='cuda')
+        exp_sums = torch.empty(size=shape_info, dtype=torch.float32, device="cuda")
+        max_logits = torch.empty(size=shape_info, dtype=torch.float32, device="cuda")
         if num_splits == 1:
             tmp_out = out
         else:
-            tmp_out = torch.empty((*shape_info, head_size), dtype=torch.float32, device='cuda')
+            tmp_out = torch.empty(
+                (*shape_info, head_size), dtype=torch.float32, device="cuda"
+            )
         kwargs = [
             exp_sums,
             max_logits,
@@ -189,7 +197,9 @@ def paged_attn_w_mma(
         shape_info = (num_seqs, num_kv_heads, num_splits, query_group_size)
         m_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
         l_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
-        tmp_out = torch.empty(size=(*shape_info, head_size), dtype=out.dtype, device=out.device)
+        tmp_out = torch.empty(
+            size=(*shape_info, head_size), dtype=out.dtype, device=out.device
+        )
         kwargs = [
             m_i,
             l_i,
@@ -264,8 +274,12 @@ def paged_attn_w_mma(
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_stages=stages, num_warps=warps) for stages in [0, 1, 3, 4] for warps in [4, 8, 16]],
-    key=['QUERY_GROUP_SIZE', 'HEAD_SIZE', 'KV_BLOCK_SIZE'],
+    configs=[
+        triton.Config({}, num_stages=stages, num_warps=warps)
+        for stages in [0, 1, 3, 4]
+        for warps in [4, 8, 16]
+    ],
+    key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
 )
 @triton.jit
 def _paged_attn_w_mma_kernel(
@@ -324,7 +338,11 @@ def _paged_attn_w_mma_kernel(
     head_offset = tl.arange(0, HEAD_SIZE)
     padding_group_offset = tl.arange(0, PADDED_QUERY_GROUP_SIZE)
 
-    kv_offset = kv_head_idx * stride_kv1 + block_offset[:, None] * stride_kv2 + head_offset[None, :] * stride_kv3
+    kv_offset = (
+        kv_head_idx * stride_kv1
+        + block_offset[:, None] * stride_kv2
+        + head_offset[None, :] * stride_kv3
+    )
 
     # Load queries.
     q_offset = (
@@ -344,7 +362,9 @@ def _paged_attn_w_mma_kernel(
     num_prev_blocks = part_idx * (PARTITION_SIZE // KV_BLOCK_SIZE)
     for i in range(num_blocks):
         block_idx = num_prev_blocks + i
-        block_number = tl.load(block_tables_ptr + seq_idx * stride_bt0 + block_idx * stride_bt1)
+        block_number = tl.load(
+            block_tables_ptr + seq_idx * stride_bt0 + block_idx * stride_bt1
+        )
 
         # Load a key block.
         kv_block_offset = block_number * stride_kv0 + kv_offset
@@ -385,7 +405,9 @@ def _paged_attn_w_mma_kernel(
 
     if USE_PARTITIONING:
         part_offset = (
-            (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE
+            (seq_idx * NUM_KV_HEADS + kv_head_idx)
+            * max_num_partitions
+            * QUERY_GROUP_SIZE
             + part_idx * QUERY_GROUP_SIZE
             + padding_group_offset
         )
@@ -398,7 +420,11 @@ def _paged_attn_w_mma_kernel(
         out_offset += kv_head_idx * stride_o1
     else:
         out_offset += kv_head_idx * QUERY_GROUP_SIZE * stride_o1
-    out_offset += part_idx * stride_o2 + padding_group_offset[:, None] * stride_o3 + head_offset[None, :] * stride_o4
+    out_offset += (
+        part_idx * stride_o2
+        + padding_group_offset[:, None] * stride_o3
+        + head_offset[None, :] * stride_o4
+    )
 
     group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
     tl.store(out_ptr + out_offset, acc, mask=group_mask)
@@ -406,7 +432,7 @@ def _paged_attn_w_mma_kernel(
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=warps) for warps in [4, 8, 16]],
-    key=['QUERY_GROUP_SIZE', 'HEAD_SIZE', 'NUM_PARTITIONS', 'PARTITION_SIZE'],
+    key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "NUM_PARTITIONS", "PARTITION_SIZE"],
 )
 @triton.jit
 def _paged_attn_w_mma_v2_reduce_kernel(
@@ -432,7 +458,10 @@ def _paged_attn_w_mma_v2_reduce_kernel(
     context_len = tl.load(context_lens_ptr + seq_idx)
 
     num_partitions = tl.cdiv(context_len, PARTITION_SIZE)
-    group_head_offset = tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE + tl.arange(0, HEAD_SIZE)[None, :]
+    group_head_offset = (
+        tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] * HEAD_SIZE
+        + tl.arange(0, HEAD_SIZE)[None, :]
+    )
     group_mask = tl.arange(0, PADDED_QUERY_GROUP_SIZE)[:, None] < QUERY_GROUP_SIZE
     if num_partitions == 1:
         tmp_out_offset = (
@@ -440,7 +469,11 @@ def _paged_attn_w_mma_v2_reduce_kernel(
         ) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE + group_head_offset
         tmp_out = tl.load(tmp_out_ptr + tmp_out_offset, mask=group_mask, other=0.0)
 
-        out_offset = seq_idx * stride_o0 + kv_head_idx * QUERY_GROUP_SIZE * stride_o1 + group_head_offset * stride_o2
+        out_offset = (
+            seq_idx * stride_o0
+            + kv_head_idx * QUERY_GROUP_SIZE * stride_o1
+            + group_head_offset * stride_o2
+        )
         tl.store(out_ptr + out_offset, tmp_out, mask=group_mask)
         return
 
@@ -470,7 +503,10 @@ def _paged_attn_w_mma_v2_reduce_kernel(
     r = tl.reshape(r, (NUM_PARTITIONS, PADDED_QUERY_GROUP_SIZE, 1))
 
     tmp_out_offset = (
-        (seq_idx * NUM_KV_HEADS + kv_head_idx) * max_num_partitions * QUERY_GROUP_SIZE * HEAD_SIZE
+        (seq_idx * NUM_KV_HEADS + kv_head_idx)
+        * max_num_partitions
+        * QUERY_GROUP_SIZE
+        * HEAD_SIZE
         + tl.arange(0, NUM_PARTITIONS)[:, None, None] * QUERY_GROUP_SIZE * HEAD_SIZE
         + tl.arange(0, PADDED_QUERY_GROUP_SIZE)[None, :, None] * HEAD_SIZE
         + tl.arange(0, HEAD_SIZE)[None, None, :]
@@ -480,7 +516,11 @@ def _paged_attn_w_mma_v2_reduce_kernel(
     # out: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
     out = tl.sum((tmp_out * r).to(tl.float32), axis=0)
 
-    out_offset = seq_idx * stride_o0 + kv_head_idx * QUERY_GROUP_SIZE * stride_o1 + group_head_offset * stride_o2
+    out_offset = (
+        seq_idx * stride_o0
+        + kv_head_idx * QUERY_GROUP_SIZE * stride_o1
+        + group_head_offset * stride_o2
+    )
     tl.store(out_ptr + out_offset, out, mask=group_mask)
 
 
@@ -509,12 +549,16 @@ def _inner_paged_attn_unroll_0_kernel(
         _qk_0 = tl.sum((q[None, :] * k_0).to(tl.float32), axis=1)
 
         if alibi_slope is not None:
-            _qk_0 += alibi_slope * ((block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1)
+            _qk_0 += alibi_slope * (
+                (block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
 
         _qk_max = tl.maximum(tl.max(_qk_0, axis=0), qk_max)
         exp_tmp = tl.exp(_qk_0 - _qk_max)
         _exp_sum = exp_sum * tl.exp(qk_max - _qk_max) + tl.sum(exp_tmp, axis=0)
-        qkv_sum_tmp = (tl.exp(_qk_0[:, None] - _qk_max)).to(v_cache.dtype.element_ty) * v_0
+        qkv_sum_tmp = (tl.exp(_qk_0[:, None] - _qk_max)).to(
+            v_cache.dtype.element_ty
+        ) * v_0
         qkv = (qkv * (exp_sum * tl.exp(qk_max - _qk_max)) + qkv_sum_tmp) / _exp_sum
         qk_max = _qk_max
         exp_sum = _exp_sum
@@ -553,17 +597,21 @@ def _inner_paged_attn_unroll_2_kernel(
         _qk_1 = tl.sum((q[None, :] * k_1).to(tl.float32), axis=1)
 
         if alibi_slope is not None:
-            _qk_0 += alibi_slope * ((block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_1 += alibi_slope * ((block_idx + 1) * BLOCK_SIZE + block_offs - seq_len + 1)
+            _qk_0 += alibi_slope * (
+                (block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_1 += alibi_slope * (
+                (block_idx + 1) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
 
         _qk_max = tl.maximum(tl.max(_qk_0, axis=0), qk_max)
         _qk_max = tl.maximum(tl.max(_qk_1, axis=0), _qk_max)
 
         exp_tmp = tl.exp(_qk_0 - _qk_max) + tl.exp(_qk_1 - _qk_max)
         _exp_sum = exp_sum * tl.exp(qk_max - _qk_max) + tl.sum(exp_tmp, axis=0)
-        qkv_sum_tmp = (tl.exp(_qk_0[:, None] - _qk_max)).to(v_cache.dtype.element_ty) * v_0 + (
-            tl.exp(_qk_1[:, None] - _qk_max)
-        ).to(v_cache.dtype.element_ty) * v_1
+        qkv_sum_tmp = (tl.exp(_qk_0[:, None] - _qk_max)).to(
+            v_cache.dtype.element_ty
+        ) * v_0 + (tl.exp(_qk_1[:, None] - _qk_max)).to(v_cache.dtype.element_ty) * v_1
         qkv = (qkv * (exp_sum * tl.exp(qk_max - _qk_max)) + qkv_sum_tmp) / _exp_sum
         qk_max = _qk_max
         exp_sum = _exp_sum
@@ -610,17 +658,30 @@ def _inner_paged_attn_unroll_4_kernel(
         _qk_3 = tl.sum((q[None, :] * k_3).to(tl.float32), axis=1)
 
         if alibi_slope is not None:
-            _qk_0 += alibi_slope * ((block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_1 += alibi_slope * ((block_idx + 1) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_2 += alibi_slope * ((block_idx + 2) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_3 += alibi_slope * ((block_idx + 3) * BLOCK_SIZE + block_offs - seq_len + 1)
+            _qk_0 += alibi_slope * (
+                (block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_1 += alibi_slope * (
+                (block_idx + 1) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_2 += alibi_slope * (
+                (block_idx + 2) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_3 += alibi_slope * (
+                (block_idx + 3) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
 
         _qk_max = tl.maximum(tl.max(_qk_0, axis=0), qk_max)
         _qk_max = tl.maximum(tl.max(_qk_1, axis=0), _qk_max)
         _qk_max = tl.maximum(tl.max(_qk_2, axis=0), _qk_max)
         _qk_max = tl.maximum(tl.max(_qk_3, axis=0), _qk_max)
 
-        exp_tmp = tl.exp(_qk_0 - _qk_max) + tl.exp(_qk_1 - _qk_max) + tl.exp(_qk_2 - _qk_max) + tl.exp(_qk_3 - _qk_max)
+        exp_tmp = (
+            tl.exp(_qk_0 - _qk_max)
+            + tl.exp(_qk_1 - _qk_max)
+            + tl.exp(_qk_2 - _qk_max)
+            + tl.exp(_qk_3 - _qk_max)
+        )
         _exp_sum = exp_sum * tl.exp(qk_max - _qk_max) + tl.sum(exp_tmp, axis=0)
         qkv_sum_tmp = (
             (tl.exp(_qk_0[:, None] - _qk_max)).to(v_cache.dtype.element_ty) * v_0
@@ -690,14 +751,30 @@ def _inner_paged_attn_unroll_8_kernel(
         _qk_7 = tl.sum((q[None, :] * k_7).to(tl.float32), axis=1)
 
         if alibi_slope is not None:
-            _qk_0 += alibi_slope * ((block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_1 += alibi_slope * ((block_idx + 1) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_2 += alibi_slope * ((block_idx + 2) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_3 += alibi_slope * ((block_idx + 3) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_4 += alibi_slope * ((block_idx + 4) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_5 += alibi_slope * ((block_idx + 5) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_6 += alibi_slope * ((block_idx + 6) * BLOCK_SIZE + block_offs - seq_len + 1)
-            _qk_7 += alibi_slope * ((block_idx + 7) * BLOCK_SIZE + block_offs - seq_len + 1)
+            _qk_0 += alibi_slope * (
+                (block_idx + 0) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_1 += alibi_slope * (
+                (block_idx + 1) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_2 += alibi_slope * (
+                (block_idx + 2) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_3 += alibi_slope * (
+                (block_idx + 3) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_4 += alibi_slope * (
+                (block_idx + 4) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_5 += alibi_slope * (
+                (block_idx + 5) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_6 += alibi_slope * (
+                (block_idx + 6) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
+            _qk_7 += alibi_slope * (
+                (block_idx + 7) * BLOCK_SIZE + block_offs - seq_len + 1
+            )
 
         _qk_max = tl.maximum(tl.max(_qk_0, axis=0), qk_max)
         _qk_max = tl.maximum(tl.max(_qk_1, axis=0), _qk_max)
@@ -737,7 +814,14 @@ def _inner_paged_attn_unroll_8_kernel(
 
 @triton.autotune(
     configs=[triton.Config({"UNROLL_FACTOR": uf}) for uf in [1, 2, 4, 8]],
-    key=['POWER_OF_2_MAX_SEQ_LEN', 'QUERY_GROUP_SIZE', 'USE_PARTITIONING', 'BLOCK_SIZE', 'HEAD_SIZE', 'PARTITION_SIZE'],
+    key=[
+        "POWER_OF_2_MAX_SEQ_LEN",
+        "QUERY_GROUP_SIZE",
+        "USE_PARTITIONING",
+        "BLOCK_SIZE",
+        "HEAD_SIZE",
+        "PARTITION_SIZE",
+    ],
 )
 @triton.jit
 def _paged_attn_wo_mma_kernel(
@@ -783,7 +867,9 @@ def _paged_attn_wo_mma_kernel(
     if USE_PARTITIONING:
         num_blocks_per_par = PARTITION_SIZE // BLOCK_SIZE
         start_block_idx = par_idx * num_blocks_per_par
-        end_block_idx = tl.minimum(start_block_idx + num_blocks_per_par, num_context_blocks)
+        end_block_idx = tl.minimum(
+            start_block_idx + num_blocks_per_par, num_context_blocks
+        )
     else:
         start_block_idx = 0
         end_block_idx = num_context_blocks
@@ -802,7 +888,11 @@ def _paged_attn_wo_mma_kernel(
     qk_max = float("-inf")
     exp_sum = 0.0
     fp16_0 = tl.zeros([1, 1], dtype=k_cache.dtype.element_ty)
-    base_offs_kv = kv_head_idx * stride_kn + block_offs[:, None] * stride_kk + head_size_offs[None, :]
+    base_offs_kv = (
+        kv_head_idx * stride_kn
+        + block_offs[:, None] * stride_kk
+        + head_size_offs[None, :]
+    )
     block_base_ptrs = block_tables + seq_idx * max_num_blocks_per_seq
 
     hi_unroll = ((end_block_idx - 1) // UNROLL_FACTOR) * UNROLL_FACTOR
@@ -881,7 +971,9 @@ def _paged_attn_wo_mma_kernel(
     tl.debug_barrier()
     # last iterations must use mask
     for block_idx in range(hi_unroll, end_block_idx):
-        physical_block_idx = tl.load(block_tables + seq_idx * max_num_blocks_per_seq + block_idx)
+        physical_block_idx = tl.load(
+            block_tables + seq_idx * max_num_blocks_per_seq + block_idx
+        )
         mask = block_offs[:, None] < (seq_len - block_idx * BLOCK_SIZE)
         offs_kv = physical_block_idx * stride_km + base_offs_kv
 
@@ -889,12 +981,19 @@ def _paged_attn_wo_mma_kernel(
         v = tl.load(v_cache + offs_kv, mask=mask, other=fp16_0)
 
         _qk = tl.sum((q[None, :] * k).to(tl.float32), axis=1)
-        _qk = tl.where(block_offs < (seq_len - block_idx * BLOCK_SIZE), _qk, float("-inf"))
+        _qk = tl.where(
+            block_offs < (seq_len - block_idx * BLOCK_SIZE), _qk, float("-inf")
+        )
         _qk += alibi_slope * (block_idx * BLOCK_SIZE + block_offs - seq_len + 1)
         _qk_max = tl.maximum(tl.max(_qk, axis=0), qk_max)
 
-        _exp_sum = exp_sum * tl.exp(qk_max - _qk_max) + tl.sum(tl.exp(_qk - _qk_max), axis=0)
-        qkv = qkv * (exp_sum * tl.exp(qk_max - _qk_max)) + (tl.exp(_qk[:, None] - _qk_max)) * v
+        _exp_sum = exp_sum * tl.exp(qk_max - _qk_max) + tl.sum(
+            tl.exp(_qk - _qk_max), axis=0
+        )
+        qkv = (
+            qkv * (exp_sum * tl.exp(qk_max - _qk_max))
+            + (tl.exp(_qk[:, None] - _qk_max)) * v
+        )
         qkv = qkv / _exp_sum
         qk_max = _qk_max
         exp_sum = _exp_sum
@@ -904,13 +1003,18 @@ def _paged_attn_wo_mma_kernel(
         tl.store(exp_sums + offs_exp, exp_sum)
         tl.store(max_logits + offs_exp, qk_max)
 
-    offs_out = seq_idx * stride_om + head_idx * stride_on + par_idx * stride_ok + head_size_offs
+    offs_out = (
+        seq_idx * stride_om
+        + head_idx * stride_on
+        + par_idx * stride_ok
+        + head_size_offs
+    )
     tl.store(out + offs_out, tl.sum(qkv, axis=0))
 
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=warps) for warps in [4, 8, 16]],
-    key=['HEAD_SIZE', 'PADDED_NUM_SPLITS', 'PARTITION_SIZE'],
+    key=["HEAD_SIZE", "PADDED_NUM_SPLITS", "PARTITION_SIZE"],
 )
 @triton.jit
 def _paged_attn_wo_mma_v2_reduce_kernel(
@@ -961,7 +1065,12 @@ def _paged_attn_wo_mma_v2_reduce_kernel(
     rescaled_exp_sum = exp_sum * tl.exp(logits - max_logit)
     global_exp_sum += tl.sum(rescaled_exp_sum, axis=0)
 
-    tmp = tl.load(tmp_out + tmp_out_ptr + tl.arange(0, PADDED_NUM_SPLITS)[:, None] * stride_tmp_k + head_size_offs)
+    tmp = tl.load(
+        tmp_out
+        + tmp_out_ptr
+        + tl.arange(0, PADDED_NUM_SPLITS)[:, None] * stride_tmp_k
+        + head_size_offs
+    )
     acc += tl.sum(tmp * rescaled_exp_sum[:, None], axis=0)
 
     inv_sum = 1.0 / (global_exp_sum + 1e-6)

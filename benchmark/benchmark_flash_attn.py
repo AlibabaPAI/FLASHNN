@@ -1,87 +1,11 @@
-import itertools
-import os
-import unittest
-
-import numpy as np
+# Copyright 2024 The FLASHNN Authors. All rights reserved.
+#
+# This source code is licensed under the Apache 2.0 license found in the
+# LICENSE file in the root directory of this source tree.
 import torch
 import triton
-from parameterized import parameterized
 
 from flashnn.triton_kernels.flash_attn_v2 import triton_flash_attention_forward
-
-
-class FlashAttnTest(unittest.TestCase):
-    def setUp(self):
-        os.environ["TRITON_CACHE_DIR"] = "/tmp/.triton"
-
-    shape_params = [
-        (2, 20, 6, 16),
-        (2, 200, 6, 16),
-        (2, 200, 6, 16),  # test triton kernel cache
-        (2, 500, 6, 128),
-    ]
-    causal_params = [True, False]
-    expand_params = [
-        (*shape, causal)
-        for shape, causal in list(itertools.product(shape_params, causal_params))
-    ]
-
-    @parameterized.expand(expand_params)
-    def test_flash_attention(self, Z, N_CTX, H, D_HEAD, causal, dtype=torch.float16):
-        torch.manual_seed(20)
-        q = torch.randn((Z, N_CTX, H, D_HEAD), dtype=dtype, device="cuda")
-        k = torch.randn((Z, N_CTX, H, D_HEAD), dtype=dtype, device="cuda")
-        v = torch.randn((Z, N_CTX, H, D_HEAD), dtype=dtype, device="cuda")
-        sm_scale = 1 / q.shape[-1] ** 0.5
-        dout = torch.randn_like(q)
-        # reference implementation
-        M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
-        p = torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1)) * sm_scale
-        if causal:
-            p[:, :, M == 0] = float("-inf")
-        p = torch.softmax(p.float(), dim=-1).half()
-        # p = torch.exp(p)
-        ref_out = torch.matmul(p, v.permute(0, 2, 1, 3))
-        ref_out = ref_out.permute(0, 2, 1, 3)
-        # triton implementation
-        tri_out = triton_flash_attention_forward(q, k, v, causal).half()
-        # compare
-        diff = ~np.isclose(
-            ref_out.cpu().numpy(), tri_out.cpu().numpy(), rtol=1e-3, atol=1e-3
-        )
-        self.assertTrue(diff.sum() < 10, f"diff.sum={diff.sum()}")
-
-    @parameterized.expand(expand_params)
-    def test_flash_attention_with_GQA(
-        self, Z, N_CTX, H, D_HEAD, causal, dtype=torch.float16
-    ):
-        torch.manual_seed(20)
-        q = torch.randn((Z, N_CTX, H, D_HEAD), dtype=dtype, device="cuda")
-        k = torch.randn((Z, N_CTX, H // 3, D_HEAD), dtype=dtype, device="cuda")
-        v = torch.randn((Z, N_CTX, H // 3, D_HEAD), dtype=dtype, device="cuda")
-        sm_scale = 1 / q.shape[-1] ** 0.5
-        dout = torch.randn_like(q)
-        # reference implementation
-        M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
-        p = (
-            torch.matmul(
-                q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1).repeat_interleave(3, dim=1)
-            )
-            * sm_scale
-        )
-        if causal:
-            p[:, :, M == 0] = float("-inf")
-        p = torch.softmax(p.float(), dim=-1).half()
-        ref_out = torch.matmul(p, v.permute(0, 2, 1, 3).repeat_interleave(3, dim=1))
-        ref_out = ref_out.permute(0, 2, 1, 3)
-        # triton implementation
-        tri_out = triton_flash_attention_forward(q, k, v, causal).half()
-        # compare
-        diff = ~np.isclose(
-            ref_out.cpu().numpy(), tri_out.cpu().numpy(), rtol=1e-3, atol=1e-3
-        )
-        self.assertTrue(diff.sum() < 10, f"diff.sum={diff.sum()}")
-
 
 try:
     from flash_attn import flash_attn_func

@@ -1,3 +1,7 @@
+# Copyright 2024 The FLASHNN Authors. All rights reserved.
+#
+# This source code is licensed under the Apache 2.0 license found in the
+# LICENSE file in the root directory of this source tree.
 import torch
 import triton
 
@@ -15,7 +19,7 @@ for K in [1664, 3328, 8896, 13312, 17792, 35584]:
             styles=[("blue", "-"), ("red", "-")],
             ylabel="Latency",
             args={"K": K},
-            plot_name=f"gemm-a8w8-K{K}_latency(us)",
+            plot_name=f"dynamic_quant-K_{K}_latency(us)",
         )
     )
 
