@@ -11,7 +11,7 @@ from flashnn.kernel_backend import get_autotune_triton_kernels
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-
+ns = 0
 def _get_autotune_configs():
     if get_autotune_triton_kernels():
         a8w8_configs = [
@@ -59,6 +59,7 @@ def _get_autotune_configs():
             triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
             triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1}, num_stages=2, num_warps=4),
         ]
+
         return a8w8_configs
     else:
         return [
@@ -70,6 +71,10 @@ def _get_autotune_configs():
         ]
 
 
+@triton.autotune(configs=_get_autotune_configs(), key=["M", "N", "K"])
+@triton.heuristics({
+    'EVEN_K': lambda args: args['K'] % (args['BLOCK_K']) == 0,
+})
 @triton.jit
 def _triton_gemm_a8w8_kernel(
     # Pointers to matrices
@@ -160,7 +165,7 @@ def _triton_gemm_a8w8_kernel(
  
     # Write back the block of the output matrix C with masks.
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :]
+    c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :] * stride_cn
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -179,7 +184,7 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
     ), "Output type must match scale type"
     assert a.shape[1] == b.shape[0], "Matrix B must be transposed"
     M, K = a.shape
-    N, K = b.shape
+    K, N = b.shape
 
     method_name = "gemm_a8w8_" + str(M) + "_" + str(N) + "_" + str(K)
     kwargs = [
@@ -199,16 +204,8 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
         out.stride(1),
     ]
 
-    a8w8_kernel = triton.heuristics({
-        'EVEN_K': lambda args: args['K'] % (args['BLOCK_K']) == 0,
-    })(_triton_gemm_a8w8_kernel)
-
-    gemm_a8w8 = triton.autotune(configs=_get_autotune_configs(), key=["M", "N", "K"])(
-        a8w8_kernel
-    )
-
     # 1D launch kernel where each block gets its own program.
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), 1, 1)
 
-    gemm_a8w8[grid](*kwargs)
+    _triton_gemm_a8w8_kernel[grid](*kwargs)

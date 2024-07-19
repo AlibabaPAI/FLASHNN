@@ -89,7 +89,7 @@ class GemmA8W8(BackendKernel):
         self.out_ty = out_ty
 
     def _triton_impl(self, a, b, alpha_row, alpha_col):
-        out = torch.empty([a.shape[0], b.shape[0]], dtype=self.out_ty, device=a.device)
+        out = torch.empty([a.shape[0], b.shape[1]], dtype=self.out_ty, device=a.device)
         triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col)
         return out
 

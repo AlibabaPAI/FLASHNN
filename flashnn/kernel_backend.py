@@ -7,7 +7,7 @@ import os
 import torch
 import torch.nn
 
-autotune_triton_kernels = os.getenv("autotune_triton_kernels", False)
+autotune_triton_kernels = os.getenv("autotune_triton_kernels", True)
 use_triton = os.getenv("USE_TRITON_KERNELS", True)
 
 
