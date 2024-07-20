@@ -83,34 +83,28 @@ class GemmA8W8(BackendKernel):
 
     def __init__(
         self,
-        m: int,
-        n: int,
-        alpha_row: torch.Tensor = None,
-        alpha_col: torch.Tensor = None,
         out_ty: torch.dtype = torch.float16,
     ):
         super().__init__()
-        self.alpha_row = alpha_row
-        self.alpha_col = alpha_col
         self.out_ty = out_ty
 
-    def _triton_impl(self, a, b):
+    def _triton_impl(self, a, b, alpha_row, alpha_col):
         out = torch.empty([a.shape[0], b.shape[0]], dtype=self.out_ty, device=a.device)
-        triton_gemm_a8w8_forward(out, a, b, self.alpha_row, self.alpha_col)
+        triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col)
         return out
 
-    def _torch_impl(self, a, b):
+    def _torch_impl(self, a, b, alpha_row, alpha_col):
         b = b.transpose(0, 1)
         x = torch.matmul(a.to(torch.float32), b.to(torch.float32))
         scale = torch.matmul(
-            torch.squeeze(self.alpha_row).flatten().unsqueeze(-1),
-            torch.squeeze(self.alpha_col).flatten().unsqueeze(0),
+            torch.squeeze(alpha_row).flatten().unsqueeze(-1),
+            torch.squeeze(alpha_col).flatten().unsqueeze(0),
         )
         out = torch.mul(x, scale)
         return out.to(self.out_ty)
 
-    def forward(self, a, b):
-        return BackendKernel.forward(self, a, b)
+    def forward(self, a, b, alpha_row, alpha_col):
+        return BackendKernel.forward(self, a, b, alpha_row, alpha_col)
 
 
 class GemmWeightOnly(BackendKernel):

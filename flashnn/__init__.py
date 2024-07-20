@@ -10,3 +10,4 @@ from .norm import LayerNorm, LayernormDquant, RMSNorm, RMSNormDquant
 from .quant_gemm import DynamicQuantize, GemmA8W8, GemmWeightOnly
 from .rotary_embedding import RotaryEmbedding
 from .triton_kernels.paged_attn_v2 import triton_paged_attention_v2
+from .triton_kernels.paged_attn import paged_attention, paged_attn_w_mma, paged_attn_wo_mma
