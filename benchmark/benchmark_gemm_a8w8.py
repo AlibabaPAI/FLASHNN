@@ -26,8 +26,8 @@ for N, K in [
     configs.append(
         triton.testing.Benchmark(
             x_names=['M'],
-            # x_vals=[1, 10, 20, 30, 40, 764, 1024, 2048, 4096, 4096 * 2],
-            x_vals=[1],
+            x_vals=[1, 10, 20, 30, 40, 764, 1024, 2048, 4096, 4096 * 2],
+            # x_vals=[1],
             line_arg='provider',
             line_vals=['triton', 'torch'],
             line_names=['Triton', "Torch"],
