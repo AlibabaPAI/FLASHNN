@@ -30,6 +30,7 @@ def benchmark(M, K, provider, input_dtype=torch.half, device="cuda"):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "triton":
+        flashnn.set_autotune_triton_kernels(True)
         flashnn.set_use_triton(True)
         triton_dynamic_quant = flashnn.DynamicQuantize()
         ms, min_ms, max_ms = triton.testing.do_bench(
