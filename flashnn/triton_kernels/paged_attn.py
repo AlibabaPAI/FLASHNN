@@ -156,13 +156,13 @@ def paged_attn_wo_mma(
                 tmp_out.stride(1),
                 tmp_out.stride(2),
             ]
-            grid = (num_q_heads, num_seqs, 1)
+            reduce_grid = (num_q_heads, num_seqs, 1)
             const_kwargs = {
                 "HEAD_SIZE": head_size,
                 "PADDED_NUM_SPLITS": padded_num_splits,
                 "PARTITION_SIZE": partition_size,
             }
-            _paged_attn_wo_mma_v2_reduce_kernel[grid](*kwargs, **const_kwargs)
+            _paged_attn_wo_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
 
 
 def paged_attn_w_mma(
@@ -270,7 +270,7 @@ def paged_attn_w_mma(
                 "PARTITION_SIZE": partition_size,
                 "NUM_PARTITIONS": triton.next_power_of_2(num_splits),
             }
-            _paged_attn_w_mma_v2_reduce_kernel[grid](*kwargs, **const_kwargs)
+            _paged_attn_w_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
 
 
 @triton.autotune(
