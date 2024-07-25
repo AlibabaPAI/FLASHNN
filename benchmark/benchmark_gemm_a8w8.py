@@ -9,16 +9,26 @@ import triton.language as tl
 
 import flashnn
 
-configs = []
-for N, K in [
-    (13312, 8896),
-    (17792, 13312),
-    (1920, 13312),
-    (13312, 1664),
-    (35584, 13312),
-    (3584, 10240),
-    (13312, 3328),
+
+NK_shapes = []
+for hidden_size, intermediate_size, tp, num_attention_heads, num_key_value_heads in [
+    (13312, 71168, 8, 104, 8),
+    (13312, 71168, 4, 104, 4),
+    (8192, 29568, 4, 64, 8),
+    (8192, 29568, 2, 64, 8),
+    (3584, 18944, 1, 28, 4),
 ]:
+    GQA = num_attention_heads // num_key_value_heads
+    NK_shapes += [
+        (hidden_size, intermediate_size // tp), # FFN Layer1
+        ((intermediate_size // tp) * 2, hidden_size), # FFN Layer2
+        (hidden_size, hidden_size // tp), # Attn output
+        ((hidden_size // tp) + ((hidden_size // tp) // GQA) * 2, hidden_size), # QKV Projection
+    ]
+
+
+configs = []
+for N, K in NK_shapes:
     configs.append(
         triton.testing.Benchmark(
             x_names=["M"],
