@@ -1,12 +1,33 @@
-# Copyright 2024 The FLASHNN Authors. All rights reserved.
-#
-# This source code is licensed under the Apache 2.0 license found in the
-# LICENSE file in the root directory of this source tree.
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
 
+from flashnn.kernel_backend import get_autotune_triton_kernels
 from flashnn.triton_kernels.triton_utils import compile_and_cache_kernels
+
+
+@lru_cache(maxsize=16)
+def _get_a8w8_configs(BM: int):
+    configs = [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": BM,
+                "BLOCK_SIZE_N": BN,
+                "BLOCK_SIZE_K": BK,
+                "GROUP_SIZE_M": gm,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for BN in [64, 128, 256]
+        for BK in [64, 128, 256]
+        for stages in [1, 3, 5]
+        for warps in [4, 8, 16]
+        for gm in [2, 4, 8]
+    ]
+    return configs
 
 
 @triton.jit
@@ -74,10 +95,16 @@ def _fused_moe_a8w8_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+    a_ptrs = A + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    b_ptrs = B + off_experts * stride_be + (offs_bn[None, :] * stride_bn + offs_k[:, None] * stride_bk)
+    b_ptrs = (
+        B
+        + off_experts * stride_be
+        + (offs_bn[None, :] * stride_bn + offs_k[:, None] * stride_bk)
+    )
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -87,9 +114,28 @@ def _fused_moe_a8w8_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
     _A0 = tl.zeros([1, 1], dtype=a_ptrs.dtype.element_ty)
     _B0 = tl.zeros([1, 1], dtype=b_ptrs.dtype.element_ty)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    lo = 0
+    hi = tl.cdiv(K, BLOCK_SIZE_K)
+    for k in range(lo, hi - 1):
         # Load the next block of A and B, generate a mask by checking the K dimension.
-        a = tl.load(a_ptrs, mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=_A0)
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None],
+            other=_A0,
+        )
+        b = tl.load(b_ptrs)
+        # We accumulate along the K dimension.
+        accumulator += tl.dot(a, b)
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+    for k in range(hi - 1, hi):
+        # Load the next block of A and B, generate a mask by checking the K dimension.
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=_A0,
+        )
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=_B0)
         # We accumulate along the K dimension.
         accumulator += tl.dot(a, b)
@@ -136,7 +182,7 @@ def fused_moe_a8w8_forward(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: dict,
+    BM: int,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using token and expert matrices.
@@ -150,6 +196,7 @@ def fused_moe_a8w8_forward(
     - alpha_row_ptr: The dequant parameter with shape (E, N) for quant intput B
     - sorted_token_ids: A tensor containing the sorted indices of tokens, repeated topk times and arranged by the expert index they are assigned to.
     - expert_ids: A tensor containing the indices of the expert for each block. It determines which expert matrix from B should be used for each block in A.
+    - BM: The block size parameter used during the alignment of token distribution across experts to ensure compatibility with matrix multiplication.
     This kernel performs the multiplication of a token by its corresponding expert matrix as determined by `expert_ids`. The sorting of `sorted_token_ids`
     by expert index and padding ensures divisibility by BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix multiplication across different blocks processed by the same expert.
     """
@@ -157,13 +204,12 @@ def fused_moe_a8w8_forward(
     assert sorted_token_ids.stride(0) == 1
     assert B.shape[1] % 16 == 0 and B.shape[2] % 16 == 0
 
-    grid = (
-        triton.cdiv(sorted_token_ids.shape[0], config['BLOCK_SIZE_M'])
-        * triton.cdiv(B.shape[1], config['BLOCK_SIZE_N']),
-        1,
-        1,
+    N, K, EM, num_valid_tokens = (
+        B.shape[1],
+        B.shape[2],
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
     )
-
     kwargs = [
         A,
         B,
@@ -174,10 +220,10 @@ def fused_moe_a8w8_forward(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        B.shape[1],
-        B.shape[2],
-        sorted_token_ids.shape[0],
-        topk_ids.numel(),
+        N,
+        K,
+        EM,
+        num_valid_tokens,
         A.stride(0),
         A.stride(1),
         B.stride(0),
@@ -192,11 +238,49 @@ def fused_moe_a8w8_forward(
     const_kwargs = {
         "MUL_ROUTED_WEIGHT": mul_routed_weight,
         "top_k": top_k,
-        "num_warps": 4,
     }
 
-    const_kwargs.update(config)
+    method_name = "fuse_moe_a8w8_" + "_".join(
+        str(value) for value in const_kwargs.values()
+    )
+    method_name += "_"
+    method_name += "_".join(str(value) for value in [BM, N, K, triton.next_power_of_2(EM)])
+    moe_kernel = _fused_moe_a8w8_kernel
+    if get_autotune_triton_kernels():
 
-    method_name = "fuse_moe_a8w8" + '_'.join(str(value) for value in const_kwargs.values())
+        def grid(META):
+            return (
+                triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+                * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
+                1,
+                1,
+            )
 
-    compile_and_cache_kernels(_fused_moe_a8w8_kernel, method_name, grid, kwargs, const_kwargs)
+        moe_kernel = triton.autotune(
+            configs=_get_a8w8_configs(BM),
+            key=["N", "K", "EM"],
+        )(moe_kernel)
+    else:
+        base_config = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 2,
+            "num_warps": 4,
+        }
+        grid = (
+            triton.cdiv(sorted_token_ids.shape[0], base_config["BLOCK_SIZE_M"])
+            * triton.cdiv(B.shape[1], base_config["BLOCK_SIZE_N"]),
+            1,
+            1,
+        )
+        const_kwargs.update(base_config)
+
+    compile_and_cache_kernels(
+        moe_kernel,
+        method_name,
+        grid,
+        kwargs,
+        const_kwargs=const_kwargs,
+    )
