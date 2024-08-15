@@ -1,0 +1,6 @@
+Metadata-Version: 2.1
+Name: flashnn
+Version: 0.1.0
+Summary: Flash: Triton Kernel Library for LLM Serving
+Author: Alibaba PAI Team
+License-File: LICENSE

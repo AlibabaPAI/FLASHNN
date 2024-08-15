@@ -360,63 +360,46 @@ def _paged_attn_w_mma_kernel(
     acc = tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
 
     num_prev_blocks = part_idx * (PARTITION_SIZE // KV_BLOCK_SIZE)
-    block_table_base = block_tables_ptr + seq_idx * stride_bt0
-    for i in range(0,num_blocks,2):
+    for i in range(num_blocks):
         block_idx = num_prev_blocks + i
         block_number = tl.load(
-            block_table_base + block_idx * stride_bt1
-        )
-        block_number1 = tl.load(
-            block_table_base + (block_idx + 1)* stride_bt1
+            block_tables_ptr + seq_idx * stride_bt0 + block_idx * stride_bt1
         )
 
         # Load a key block.
         kv_block_offset = block_number * stride_kv0 + kv_offset
-        kv_block_offset1 = block_number1 * stride_kv0 + kv_offset
         mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
-        mask_offset1 = (block_idx+1) * KV_BLOCK_SIZE + block_offset
         kv_mask = mask_offset[:, None] < context_len
-        kv_mask1 = mask_offset1[:, None] < context_len
 
         # k: [KV_BLOCK_SIZE, HEAD_SIZE]
         k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
-        k1 = tl.load(k_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
 
         # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         if PADDED_QUERY_GROUP_SIZE == 1:
             qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
-            qk1 = tl.sum(q[:, None, :] * k1[None, :, :], axis=2)
         else:
             qk = tl.dot(q, k.T, out_dtype=tl.float32)
-            qk1 = tl.dot(q, k1.T, out_dtype=tl.float32)
 
         # qk *= attn_scale
         qk = tl.where(mask_offset < context_len, qk, float("-inf"))
-        qk1 = tl.where(mask_offset1 < context_len, qk1, float("-inf"))
 
-        m_i_new0 = tl.maximum(m_i, tl.max(qk, axis=1))
-        m_i_new = tl.maximum(m_i_new0, tl.max(qk1, axis=1))
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
 
         # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         p = tl.math.exp2((qk - m_i_new[:, None]) * log2e)
-        p1 = tl.math.exp2((qk1 - m_i_new[:, None]) * log2e)
         alpha = tl.math.exp2((m_i - m_i_new) * log2e)
         acc *= alpha[:, None]
 
         # v: [KV_BLOCK_SIZE, HEAD_SIZE]
         v = tl.load(v_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
-        v1 = tl.load(v_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
 
         if PADDED_QUERY_GROUP_SIZE == 1:
             acc += tl.sum(p.T[:, :, None] * v[:, None, :], axis=0)
-            acc += tl.sum(p1.T[:, :, None] * v1[:, None, :], axis=0)
         else:
             p = p.to(v.dtype)
-            p1 = p1.to(v.dtype)
             acc += tl.dot(p, v, out_dtype=tl.float32)
-            acc += tl.dot(p1, v1, out_dtype=tl.float32)
 
-        l_i = l_i * alpha + tl.sum(p, axis=1) +  tl.sum(p1, axis=1)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
     acc = acc / l_i[:, None]
 
