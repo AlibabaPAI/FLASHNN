@@ -99,36 +99,36 @@ configs = []
 HEAD_DIM = 128
 tmp = [
     (1, 16, 16),
-    (64, 16, 16),
-    (1, 32, 32),
-    (64, 32, 32),
-    (1, 32, 4),
+#    (64, 16, 16),
+#    (1, 32, 32),
+#    (64, 32, 32),
+#    (1, 32, 4),
     (64, 32, 4),
-    (1, 52, 4),
-    (64, 52, 4),
+#    (1, 52, 4),
+#    (64, 52, 4),
     (1, 16, 2),
-    (64, 16, 2),
-    (1, 26, 2),
-    (64, 26, 2),
-    (1, 8, 1),
-    (64, 8, 1),
-    (1, 13, 1),
-    (64, 13, 1),
+#    (64, 16, 2),
+#    (1, 26, 2),
+#    (64, 26, 2),
+#    (1, 8, 1),
+#    (64, 8, 1),
+#    (1, 13, 1),
+#    (64, 13, 1),
 ]
 for bs, q_head, kv_head in tmp:
     configs.append(
         triton.testing.Benchmark(
             x_names=["max_seq_len"],
-            x_vals=[2**i for i in range(8, 14)],
-            # x_vals=[8192],
+#            x_vals=[2**i for i in range(8, 14)],
+            x_vals=[8192],
             line_arg="provider",
             line_vals=(
-                ["torch", "triton_fma", "triton_mma"]
+                ["triton_fma", "triton_mma"]
                 + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
                 + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
             ),
             line_names=(
-                ["Troch", "Triton FMA", "Triton MMA"]
+                ["Triton FMA", "Triton MMA"]
                 + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
                 + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
             ),
