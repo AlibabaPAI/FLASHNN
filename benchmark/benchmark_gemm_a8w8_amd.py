@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 import flashnn
-import pytest
 
 
 def num_tensors(M, N, K):
