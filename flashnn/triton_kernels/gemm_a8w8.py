@@ -167,8 +167,8 @@ def _triton_gemm_a8w8_kernel(
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     alpha_row_ptrs = alpha_row_ptr + offs_cm
     alpha_col_ptrs = alpha_col_ptr + offs_cn
-    alpha_row = tl.load(alpha_row_ptrs, mask=offs_cm < M, other=0., cache_modifier=".cg").to(tl.float32)
-    alpha_col = tl.load(alpha_col_ptrs, mask=offs_cn < N, other=0., cache_modifier=".cg").to(tl.float32)
+    alpha_row = tl.load(alpha_row_ptrs, mask=offs_cm < M, other=0.).to(tl.float32)
+    alpha_col = tl.load(alpha_col_ptrs, mask=offs_cn < N, other=0.).to(tl.float32)
     accumulator = accumulator * alpha_row[:, None]
     accumulator = accumulator * alpha_col[None, :]
     c = accumulator.to(C.dtype.element_ty)
