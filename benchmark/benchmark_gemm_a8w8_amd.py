@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 import flashnn
-
+import pytest
 
 def num_tensors(M, N, K):
     size = M * N + M * K + N * K + M + N
@@ -93,3 +93,30 @@ def benchmark(M, N, K, provider):
 if __name__ == "__main__":
     benchmark.run(show_plots=False, print_data=True)
 
+def get_shapes():
+    shapes = []
+    for n, k, in NK_shapes:
+        for m in [1, 10, 20, 30, 40, 764, 1024, 2048, 4096, 4096 * 2]:
+            shapes.append((m, n, k))
+    return shapes
+
+@pytest.mark.parametrize('m, n, k', get_shapes())
+def test_gemm_a8w8(m, n, k):
+    torch.random.manual_seed(0)
+    with torch.no_grad():
+        a = torch.randint(-12, 12, (m, k), dtype=torch.int8).cuda()
+        b = torch.randint(-12, 12, (n, k), dtype=torch.int8).cuda()
+
+        alpha_row = torch.rand([m, 1], dtype=torch.half).cuda()
+        alpha_col = torch.rand([1, n], dtype=torch.half).cuda()
+
+        torch_gemm_a8w8 = flashnn.GemmA8W8(out_ty=torch.half)
+        out_torch = torch_gemm_a8w8(a, b, alpha_row=alpha_row, alpha_col=alpha_col)
+
+        flashnn.set_use_triton(True)
+        flashnn.set_autotune_triton_kernels(True)
+        triton_gemm_a8w8 = flashnn.GemmA8W8(out_ty=torch.half)
+        out_triton = triton_gemm_a8w8(a, b, alpha_row, alpha_col)
+
+        diff = ~np.isclose(out_triton.half().cpu().numpy(), out_torch.half().cpu().numpy(), rtol=1e-2)
+        assert diff.sum() < 10, f"m={m}, n={n}, k={k}"

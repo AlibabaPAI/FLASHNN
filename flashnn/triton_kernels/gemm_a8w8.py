@@ -180,6 +180,7 @@ def _triton_gemm_a8w8_kernel(
 
 
 def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
+    print(f"a_shape = {a.shape}, b_shape = {b.shape}")
     # Check constraints.
     assert (
         a.dtype == torch.int8 and b.dtype == torch.int8
@@ -192,9 +193,9 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
     assert (
         out.dtype == alpha_row.dtype and out.dtype == alpha_col.dtype
     ), "Output type must match scale type"
-    assert a.shape[1] == b.shape[0], "Matrix B must be transposed"
+    assert a.shape[1] == b.shape[1], "Matrix B must be transposed"
     M, K = a.shape
-    K, N = b.shape
+    N, K = b.shape
 
     method_name = "gemm_a8w8_" + str(M) + "_" + str(N) + "_" + str(K)
     kwargs = [
@@ -208,8 +209,8 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
         K,
         a.stride(0),
         a.stride(1),
-        b.stride(0),
         b.stride(1),
+        b.stride(0),
         out.stride(0),
         out.stride(1),
     ]
