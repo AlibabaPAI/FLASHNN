@@ -127,29 +127,39 @@ def _triton_gemm_a8w8_kernel(
     ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
-    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
-    B = B + (rbn[None, :] * stride_bn + rk[:, None] * stride_bk)
+    a_ptrs = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    b_ptrs = B + (rbn[None, :] * stride_bn + rk[:, None] * stride_bk)
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # _0 = tl.zeros([1, 1], dtype=A.dtype.element_ty)
     acc_type = tl.int32 if A.dtype.element_ty == tl.int8 else tl.float32
     accumulator = tl.zeros([BLOCK_M, BLOCK_N], dtype=acc_type)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
+    loop_k = tl.cdiv(K, BLOCK_K)
+    if not EVEN_K:
+        loop_k -= 1
+
+    for _ in range(0, loop_k):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
-        if EVEN_K:
-            a = tl.load(A)
-            b = tl.load(B)
-        else:
-            k_remaining = K - k * BLOCK_K
-            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
-            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
         # We accumulate along the K dimension.
         accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
-        A += BLOCK_K * stride_ak
-        B += BLOCK_K * stride_bk
- 
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    if not EVEN_K:
+        k = loop_k
+        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
+        a_ptrs = A + (ram[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = B + (rbn[None, :] * stride_bn + offs_k[:, None] * stride_bk)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K, other=0.)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K, other=0.)
+        # We accumulate along the K dimension.
+        accumulator += tl.dot(a, b)
+
+
     # -----------------------------------------------------------
     # `alpha_row_ptrs` is a block of [BLOCK_M] pointers
     # `alpha_col_ptrs` is a block of [BLOCK_N] pointers
@@ -157,15 +167,15 @@ def _triton_gemm_a8w8_kernel(
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     alpha_row_ptrs = alpha_row_ptr + offs_cm
     alpha_col_ptrs = alpha_col_ptr + offs_cn
-    alpha_row = tl.load(alpha_row_ptrs, mask=offs_cm < M, other=0.).to(tl.float32)
-    alpha_col = tl.load(alpha_col_ptrs, mask=offs_cn < N, other=0.).to(tl.float32)
+    alpha_row = tl.load(alpha_row_ptrs, mask=offs_cm < M, other=0., cache_modifier=".cg").to(tl.float32)
+    alpha_col = tl.load(alpha_col_ptrs, mask=offs_cn < N, other=0., cache_modifier=".cg").to(tl.float32)
     accumulator = accumulator * alpha_row[:, None]
     accumulator = accumulator * alpha_col[None, :]
     c = accumulator.to(C.dtype.element_ty)
  
     # Write back the block of the output matrix C with masks.
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :] * stride_cn
+    c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :]
     tl.store(c_ptrs, c, mask=c_mask)
 
 
