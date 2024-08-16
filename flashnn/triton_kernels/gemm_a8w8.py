@@ -89,8 +89,8 @@ def _triton_gemm_a8w8_kernel(
     K,
     stride_am,
     stride_ak,
-    stride_bk,
     stride_bn,
+    stride_bk,
     stride_cm,
     stride_cn,
     # Meta-parameters
@@ -208,8 +208,8 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
         K,
         a.stride(0),
         a.stride(1),
-        b.stride(1),
         b.stride(0),
+        b.stride(1),
         out.stride(0),
         out.stride(1),
     ]
