@@ -8,55 +8,58 @@ import triton.language as tl
 from flashnn.kernel_backend import get_autotune_triton_kernels
 
 
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
+
+ns = 0
 def _get_autotune_configs():
     if get_autotune_triton_kernels():
         a8w8_configs = [
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-                num_stages=3,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=2,
-                num_warps=8,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=4,
-                num_warps=4,
-            ),
-            triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=5,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 8},
-                num_stages=5,
-                num_warps=2,
-            ),
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_SIZE_M": 1},
-                num_stages=2,
-                num_warps=4,
-            ),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256, 'GROUP_SIZE_M': 4, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 4, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=8),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 256, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 32, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 256, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 256, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 32, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 256, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 256, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 256, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=2),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 2}, num_stages=0, num_warps=4),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1, 'matrix_instr_nonkdim': 16, 'kpack': 1}, num_stages=0, num_warps=4),
+        ] if is_hip() else [
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_SIZE_M': 1}, num_stages=2, num_warps=4),
         ]
+
         return a8w8_configs
     else:
         return [
@@ -68,6 +71,10 @@ def _get_autotune_configs():
         ]
 
 
+@triton.autotune(configs=_get_autotune_configs(), key=["M", "N", "K"])
+@triton.heuristics({
+    'EVEN_K': lambda args: args['K'] % (args['BLOCK_K']) == 0,
+})
 @triton.jit
 def _triton_gemm_a8w8_kernel(
     # Pointers to matrices
@@ -82,8 +89,8 @@ def _triton_gemm_a8w8_kernel(
     K,
     stride_am,
     stride_ak,
-    stride_bn,
     stride_bk,
+    stride_bn,
     stride_cm,
     stride_cn,
     # Meta-parameters
@@ -91,6 +98,7 @@ def _triton_gemm_a8w8_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ):
     """Kernel for computing the matmul
         out <- ((int8)A[m, k] * (int8)B[n, k]) *
@@ -109,6 +117,7 @@ def _triton_gemm_a8w8_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
@@ -118,25 +127,29 @@ def _triton_gemm_a8w8_kernel(
     ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
     rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
-    A = A + (ram[:, None] * stride_am + rk[None, :])
-    B = B + (rbn[:, None] * stride_bn + rk[None, :])
+    A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
+    B = B + (rbn[None, :] * stride_bn + rk[:, None] * stride_bk)
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
-    _0 = tl.zeros([1, 1], dtype=A.dtype.element_ty)
-    accumulator = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    # _0 = tl.zeros([1, 1], dtype=A.dtype.element_ty)
+    acc_type = tl.int32 if A.dtype.element_ty == tl.int8 else tl.float32
+    accumulator = tl.zeros([BLOCK_M, BLOCK_N], dtype=acc_type)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
-        k_remaining = K - k * BLOCK_K
-        a = tl.load(A, mask=rk[None, :] < k_remaining, other=_0)
-        b = tl.load(B, mask=rk[None, :] < k_remaining, other=_0)
-        b = tl.trans(b)
+        if EVEN_K:
+            a = tl.load(A)
+            b = tl.load(B)
+        else:
+            k_remaining = K - k * BLOCK_K
+            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.)
+            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.)
         # We accumulate along the K dimension.
         accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         A += BLOCK_K * stride_ak
         B += BLOCK_K * stride_bk
-
+ 
     # -----------------------------------------------------------
     # `alpha_row_ptrs` is a block of [BLOCK_M] pointers
     # `alpha_col_ptrs` is a block of [BLOCK_N] pointers
@@ -144,16 +157,15 @@ def _triton_gemm_a8w8_kernel(
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     alpha_row_ptrs = alpha_row_ptr + offs_cm
     alpha_col_ptrs = alpha_col_ptr + offs_cn
-    _ALPHA0 = tl.zeros([1], dtype=alpha_row_ptr.dtype.element_ty)
-    alpha_row = tl.load(alpha_row_ptrs, mask=offs_cm < M, other=_ALPHA0).to(tl.float32)
-    alpha_col = tl.load(alpha_col_ptrs, mask=offs_cn < N, other=_ALPHA0).to(tl.float32)
+    alpha_row = tl.load(alpha_row_ptrs, mask=offs_cm < M, other=0.).to(tl.float32)
+    alpha_col = tl.load(alpha_col_ptrs, mask=offs_cn < N, other=0.).to(tl.float32)
     accumulator = accumulator * alpha_row[:, None]
     accumulator = accumulator * alpha_col[None, :]
     c = accumulator.to(C.dtype.element_ty)
-
+ 
     # Write back the block of the output matrix C with masks.
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :]
+    c_ptrs = C + stride_cm * offs_cm[:, None] + offs_cn[None, :] * stride_cn
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -163,16 +175,16 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
         a.dtype == torch.int8 and b.dtype == torch.int8
     ), "Matrix A/B must be int8 type"
     assert a.is_contiguous(), "Matrix A must be contiguous"
-    assert b.is_contiguous(), "Matrix B must be contiguous"
+    # assert b.is_contiguous(), "Matrix B must be contiguous"
     assert (
         out.dtype == torch.float16 or out.dtype == torch.bfloat16
     ), "Output type must be float16 or bfloat16"
     assert (
         out.dtype == alpha_row.dtype and out.dtype == alpha_col.dtype
     ), "Output type must match scale type"
-    assert a.shape[1] == b.shape[1], "Matrix B must be transposed"
+    assert a.shape[1] == b.shape[0], "Matrix B must be transposed"
     M, K = a.shape
-    N, K = b.shape
+    K, N = b.shape
 
     method_name = "gemm_a8w8_" + str(M) + "_" + str(N) + "_" + str(K)
     kwargs = [
@@ -191,12 +203,9 @@ def triton_gemm_a8w8_forward(out, a, b, alpha_row, alpha_col):
         out.stride(0),
         out.stride(1),
     ]
-    gemm_a8w8 = triton.autotune(configs=_get_autotune_configs(), key=["M", "N", "K"])(
-        _triton_gemm_a8w8_kernel
-    )
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), 1, 1)
 
-    gemm_a8w8[grid](*kwargs)
+    _triton_gemm_a8w8_kernel[grid](*kwargs)
