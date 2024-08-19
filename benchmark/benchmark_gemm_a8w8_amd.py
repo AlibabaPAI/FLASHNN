@@ -76,7 +76,7 @@ def benchmark(M, N, K, provider):
         flashnn.set_autotune_triton_kernels(True)
         triton_gemm_a8w8 = flashnn.GemmA8W8(out_ty=torch.half)
         ms, min_ms, max_ms = triton.testing.do_bench_rotating_tensor(
-            lambda i: triton_gemm_a8w8(a[i % tensor_num], b[i % tensor_num].T, alpha_row[i % tensor_num], alpha_col[i % tensor_num]), rep=100, quantiles=quantiles
+            lambda i: triton_gemm_a8w8(a[i % tensor_num], b[i % tensor_num], alpha_row[i % tensor_num], alpha_col[i % tensor_num]), rep=100, quantiles=quantiles
         )
     if provider == 'torch':
         flashnn.set_use_triton(False)
