@@ -6,7 +6,33 @@ import triton
 import triton.language as tl
 from flashnn.kernel_backend import THREADS_PER_WARP
 
+from flashnn.kernel_backend import get_autotune_triton_kernels
 
+def _get_autotune_configs():
+    if get_autotune_triton_kernels():
+        dq_configs = [
+            triton.Config(
+                {},
+                num_warps=16,
+            ),
+            triton.Config(
+                {},
+                num_warps=8,
+            ),
+            triton.Config(
+                {},
+                num_warps=4,
+            ),
+        ]
+        return dq_configs
+    else:
+        return [
+            triton.Config(
+                {},
+                num_warps=4,
+            ),
+        ]
+        
 @triton.jit
 def _abs_max(val1, val2):
     val1_abs = tl.abs(val1)
@@ -16,7 +42,7 @@ def _abs_max(val1, val2):
     else:
         return val2_abs
 
-
+@triton.autotune(configs=_get_autotune_configs(), key=["M", "N"])
 @triton.jit
 def _triton_dynamic_quantize_kernel(
     output_ptr,
@@ -56,7 +82,7 @@ def triton_dynamic_quantize(out, input, scale):
     else:
         hidden_size = triton.next_power_of_2(int(hidden_size))
         block_size = min(hidden_size / 2, block_size)
-    num_warps = int(max(block_size / THREADS_PER_WARP, 1))
+    # num_warps = int(max(block_size / THREADS_PER_WARP, 1))
     _triton_dynamic_quantize_kernel[(num_tokens,)](
         out,
         input,
@@ -68,5 +94,4 @@ def triton_dynamic_quantize(out, input, scale):
         n_elements=input.size(1),
         M=num_tokens,
         N=hidden_size,
-        num_warps=num_warps,
     )
