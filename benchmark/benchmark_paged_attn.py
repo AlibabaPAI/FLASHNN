@@ -97,68 +97,67 @@ def ref_single_query_cached_kv_attention(
 
 configs = []
 HEAD_DIM = 128
-tmp = [
-    (1, 16, 16),
-    (64, 16, 16),
-    (1, 32, 32),
-    (64, 32, 32),
-    (1, 32, 4),
-    (64, 32, 4),
-    (1, 52, 4),
-    (64, 52, 4),
-    (1, 16, 2),
-    (64, 16, 2),
-    (1, 26, 2),
-    (64, 26, 2),
-    (1, 8, 1),
-    (64, 8, 1),
-    (1, 13, 1),
-    (64, 13, 1),
+test_cases = [
+# (1, 16384, 32, 4),
+# (1, 16384, 16, 16),
+# (1, 4096, 16, 16),
+# (1, 8192, 16, 16),
+# (1, 16384, 16,16),
+(1, 1024, 52, 4),
+(1, 2048, 52, 4),
+(1, 4096, 52, 4),
+(1, 8192, 52, 4),
+(1, 16384, 52,4),
+(64,1024, 52, 4),
+(64,16384, 52, 4),
+(1, 1024, 8 ,1),
+(1, 2048, 8 ,1),
+(1, 4096, 8 ,1),
+(1, 8192, 8 ,1),
+(1, 16384, 8, 1),
+(64,1024, 8, 1),
+(64,16384, 8, 1),
+(64, 16384, 32, 4),
 ]
-for bs, q_head, kv_head in tmp:
-    configs.append(
-        triton.testing.Benchmark(
-            x_names=["max_seq_len"],
-            x_vals=[2**i for i in range(8, 14)],
-            # x_vals=[8192],
-            line_arg="provider",
-            line_vals=(
-                ["torch", "triton_fma", "triton_mma"]
-                + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
-                + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
-            ),
-            line_names=(
-                ["Torch", "Triton FMA", "Triton MMA"]
-                + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
-                + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
-            ),
-            styles=[
-                ("red", "-"),
-                ("yellow", "-"),
-                ("blue", "-"),
-                ("green", "-"),
-                ("orange", "-"),
-                ("purple", "-"),
-            ],
-            ylabel="ms",
-            plot_name=f"BS={bs},num_head_q={q_head},num_heads_kv={kv_head},head_size=128, block_size=16,num_blocks=10240",
-            args={
-                "num_seqs": bs,
-                "q_head": q_head,
-                "kv_head": kv_head,
-                "head_size": 128,
-                "block_size": 16,
-                "num_blocks": 10240,
-                "dtype": torch.float16,
-            },
-        )
-    )
 
+configs.append(
+    triton.testing.Benchmark(
+        x_names=['num_seqs', 'seq_len', 'q_head', 'kv_head'],
+        x_vals=test_cases,
+        line_arg="provider",
+        line_vals=(
+            ["triton_fma", "triton_mma"]
+            + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
+            + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
+        ),
+        line_names=(
+            ["Triton FMA", "Triton MMA"]
+            + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
+            + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
+        ),
+        styles=[
+            ("red", "-"),
+            ("yellow", "-"),
+            ("blue", "-"),
+            ("green", "-"),
+            ("orange", "-"),
+            ("purple", "-"),
+        ],
+        ylabel="ms",
+        plot_name=f"head_size=128, block_size=16,num_blocks=10240",
+        args={
+            "head_size": 128,
+            "block_size": 16,
+            "num_blocks": 10240,
+            "dtype": torch.float16,
+        },
+    )
+)
 
 @triton.testing.perf_report(configs)
 def benchmark(
     num_seqs,
-    max_seq_len,
+    seq_len,
     q_head,
     kv_head,
     head_size,
@@ -179,7 +178,7 @@ def benchmark(
         (num_blocks, *value_block_shape), dtype=dtype, device="cuda"
     )
 
-    context_lens = [max_seq_len for _ in range(num_seqs)]
+    context_lens = [seq_len for _ in range(num_seqs)]
     max_context_len = max(context_lens)
     context_lens = torch.tensor(context_lens, dtype=torch.int, device="cuda")
 
