@@ -120,6 +120,9 @@ test_cases = [
 (64, 16384, 32, 4),
 ]
 
+input_block_size = 16
+input_block_num = 10240
+
 configs.append(
     triton.testing.Benchmark(
         x_names=['num_seqs', 'seq_len', 'q_head', 'kv_head'],
@@ -127,13 +130,13 @@ configs.append(
         line_arg="provider",
         line_vals=(
             ["triton_fma", "triton_mma"]
-            + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
-            + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
+            # + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
+            # + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
         line_names=(
             ["Triton FMA", "Triton MMA"]
-            + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
-            + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
+            # + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
+            # + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
         styles=[
             ("red", "-"),
@@ -144,11 +147,11 @@ configs.append(
             ("purple", "-"),
         ],
         ylabel="ms",
-        plot_name=f"head_size=128, block_size=16,num_blocks=10240",
+        plot_name=f"head_size=128, block_size={input_block_size},num_blocks=2560",
         args={
             "head_size": 128,
-            "block_size": 16,
-            "num_blocks": 10240,
+            "block_size": input_block_size,
+            "num_blocks": input_block_num,
             "dtype": torch.float16,
         },
     )
@@ -363,7 +366,7 @@ def benchmark(
             )
 
     def ms2us(ms):
-        return ms * 1000
+        return round(ms * 1000, 2)
 
     return ms2us(ms), ms2us(min_ms), ms2us(max_ms)
 
