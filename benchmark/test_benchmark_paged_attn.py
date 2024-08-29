@@ -292,6 +292,7 @@ def benchmark(
         )
 
     if provider == "triton_mma_unrolling4":
+        print(f"triton_mma_unrolling4, partition_size = {partition_size}")
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: paged_attn_w_mma_unrolling4(
                 out,
@@ -532,10 +533,9 @@ def test_paged_attn(B, ctx_n, num_q_heads, num_kv_heads, head_size=HEAD_DIM, blo
     #     device=torch.cuda.device_of(query),
     # )
 
-
     # triton implementation with unrolling4
     out_mma_unrolling4 = torch.empty_like(query)
-    print(f"partition_size = {partition_size}")
+    print(f"partition_size = {partition_size}, block_num = {ctx_n // block_size}")
     # paged_attn_w_mma_unrolling4(
     #     out_mma_unrolling4,
     #     query,
