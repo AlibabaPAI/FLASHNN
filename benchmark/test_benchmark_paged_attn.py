@@ -123,10 +123,10 @@ def get_input_shapes():
     ]
     return test_cases
 
-
+total_slots = 16 * 10240
 input_block_size = 64
-input_block_num = 2560
-split_size = 512
+input_block_num = total_slots // input_block_size
+split_size = 256
 
 configs.append(
     triton.testing.Benchmark(
@@ -152,7 +152,7 @@ configs.append(
             ("purple", "-"),
         ],
         ylabel="ms",
-        plot_name=f"head_size=128, block_size={input_block_size},num_blocks=2560",
+        plot_name=f"head_size=128, block_size={input_block_size},num_blocks={input_block_num},parititon_size={split_size}",
         args={
             "head_size": 128,
             "block_size": input_block_size,
@@ -292,7 +292,6 @@ def benchmark(
         )
 
     if provider == "triton_mma_unrolling4":
-        print(f"triton_mma_unrolling4, partition_size = {partition_size}")
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: paged_attn_w_mma_unrolling4(
                 out,
@@ -535,20 +534,6 @@ def test_paged_attn(B, ctx_n, num_q_heads, num_kv_heads, head_size=HEAD_DIM, blo
 
     # triton implementation with unrolling4
     out_mma_unrolling4 = torch.empty_like(query)
-    print(f"partition_size = {partition_size}, block_num = {ctx_n // block_size}")
-    # paged_attn_w_mma_unrolling4(
-    #     out_mma_unrolling4,
-    #     query,
-    #     key_cache_tri,
-    #     value_cache_tri,
-    #     context_lens,
-    #     block_tables,
-    #     scale,
-    #     max_context_len,
-    #     num_splits=triton.cdiv(max_context_len, partition_size),
-    #     partition_size=partition_size,
-    #     device=torch.cuda.device_of(query),
-    # )
     paged_attn_w_mma_unrolling4(
         out_mma_unrolling4,
         query,
