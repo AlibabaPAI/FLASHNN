@@ -725,8 +725,8 @@ def _paged_attn_w_mma_kernel_unrolling4(
         # k: [KV_BLOCK_SIZE, HEAD_SIZE]
         k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
         k1 = tl.load(k_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
-        k2 = tl.load(k_cache_ptr + kv_block_offset2, mask=kv_mask, other=0.0)
-        k3 = tl.load(k_cache_ptr + kv_block_offset3, mask=kv_mask1, other=0.0)
+        k2 = tl.load(k_cache_ptr + kv_block_offset2, mask=kv_mask2, other=0.0)
+        k3 = tl.load(k_cache_ptr + kv_block_offset3, mask=kv_mask3, other=0.0)
 
         # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
         if PADDED_QUERY_GROUP_SIZE == 1:
