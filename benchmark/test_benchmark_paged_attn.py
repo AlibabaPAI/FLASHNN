@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import triton
 from parameterized import parameterized
+import pytest
 
 from flashnn.triton_kernels.paged_attn import paged_attn_w_mma, paged_attn_wo_mma, paged_attn_w_mma_unrolling4
 
@@ -97,28 +98,31 @@ def ref_single_query_cached_kv_attention(
 
 configs = []
 HEAD_DIM = 128
-test_cases = [
-# (1, 16384, 32, 4),
-# (1, 16384, 16, 16),
-# (1, 4096, 16, 16),
-# (1, 8192, 16, 16),
-# (1, 16384, 16,16),
-(1, 1024, 52, 4),
-(1, 2048, 52, 4),
-(1, 4096, 52, 4),
-(1, 8192, 52, 4),
-(1, 16384, 52,4),
-(64,1024, 52, 4),
-(64,16384, 52, 4),
-(1, 1024, 8 ,1),
-(1, 2048, 8 ,1),
-(1, 4096, 8 ,1),
-(1, 8192, 8 ,1),
-(1, 16384, 8, 1),
-(64,1024, 8, 1),
-(64,16384, 8, 1),
-(64, 16384, 32, 4),
-]
+def get_input_shapes():
+    test_cases = [
+    # (1, 16384, 32, 4),
+    # (1, 16384, 16, 16),
+    # (1, 4096, 16, 16),
+    # (1, 8192, 16, 16),
+    # (1, 16384, 16,16),
+    (1, 1024, 52, 4),
+    (1, 2048, 52, 4),
+    (1, 4096, 52, 4),
+    (1, 8192, 52, 4),
+    (1, 16384, 52,4),
+    (64,1024, 52, 4),
+    (64,16384, 52, 4),
+    (1, 1024, 8 ,1),
+    (1, 2048, 8 ,1),
+    (1, 4096, 8 ,1),
+    (1, 8192, 8 ,1),
+    (1, 16384, 8, 1),
+    (64,1024, 8, 1),
+    (64,16384, 8, 1),
+    (64, 16384, 32, 4),
+    ]
+    return test_cases
+
 
 input_block_size = 64
 input_block_num = 2560
@@ -127,17 +131,17 @@ split_size = 512
 configs.append(
     triton.testing.Benchmark(
         x_names=['num_seqs', 'seq_len', 'q_head', 'kv_head'],
-        x_vals=test_cases,
+        x_vals=get_input_shapes(),
         line_arg="provider",
         line_vals=(
             ["triton_fma", "triton_mma", "triton_mma_unrolling4"]
             # + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
-            # + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
+            + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
         line_names=(
             ["Triton FMA", "Triton MMA", "MMA Unroll4"]
             # + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
-            # + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
+            + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
         styles=[
             ("red", "-"),
@@ -172,6 +176,11 @@ def benchmark(
     eps=1e-5,
     device="cuda",
 ):
+    # vllm implementation needs to use block_size 16 and partition_size 256
+    if provider.startswith("vllm") and provider != "vllm_v1":
+        PARTITION_SIZE = 256
+        block_size = 16
+    
     query = torch.empty(num_seqs, q_head, head_size, dtype=dtype, device="cuda")
 
     x = 16 // torch.tensor([], dtype=dtype).element_size()
@@ -339,6 +348,8 @@ def benchmark(
             device=out.device,
         )
         max_logits = torch.empty_like(exp_sums)
+        # block size need to be hard-coded for customized HIP kernel
+        block_size = 16
         if provider == "vllm_v2":
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: ops.paged_attention_v2(
@@ -395,3 +406,199 @@ def benchmark(
 
 if __name__ == "__main__":
     benchmark.run(show_plots=True, print_data=True)
+
+
+@pytest.mark.parametrize('B, ctx_n, num_q_heads, num_kv_heads',
+                        get_input_shapes())
+def test_paged_attn(B, ctx_n, num_q_heads, num_kv_heads, head_size=HEAD_DIM, block_size=16, num_blocks=10240, partition_size=256, dtype=torch.half):
+    qkv = torch.ones(B, 3, num_q_heads, head_size, dtype=dtype, device="cuda")
+    query, key, value = qkv.unbind(dim=1)
+
+    x = 16 // torch.tensor([], dtype=dtype).element_size()
+    key_block_shape = (num_kv_heads, head_size // x, block_size, x)
+    key_cache = torch.ones((num_blocks, *key_block_shape), dtype=dtype, device="cuda")
+    value_block_shape = (num_kv_heads, head_size, block_size)
+    value_cache = torch.randn(
+        (num_blocks, *value_block_shape), dtype=dtype, device="cuda"
+    )
+
+    context_lens = [ctx_n for _ in range(B)]
+    max_context_len = max(context_lens)
+    context_lens = torch.tensor(context_lens, dtype=torch.int, device="cuda")
+    # max_context_len=8192
+    # context_lens = [max_context_len for _ in range(num_seqs)]
+    # context_lens = torch.tensor(context_lens, dtype=torch.int, device='cuda')
+
+    max_num_blocks_per_seq = (max_context_len + block_size - 1) // block_size
+    block_tables = []
+    for i in range(B):
+        block_table = [
+            i for i in range(max_num_blocks_per_seq)
+            # random.randint(0, num_blocks - 1) for _ in range(max_num_blocks_per_seq)
+        ]
+        block_tables.append(block_table)
+    block_tables = torch.tensor(block_tables, dtype=torch.int, device="cuda")
+    # head_mapping = torch.arange(num_q_heads, dtype=torch.int32, device="cuda")
+
+    scale = float(1.0 / (head_size**0.5))
+
+    assert num_q_heads % num_kv_heads == 0
+    num_queries_per_kv = num_q_heads // num_kv_heads
+    # head_mapping = torch.repeat_interleave(
+    #     torch.arange(num_kv_heads, dtype=torch.int32, device="cuda"), num_queries_per_kv
+    # )
+
+    num_slots = block_size * num_blocks
+    # slot_mapping = random.sample(range(num_slots), num_seqs)
+    # slot_mapping = [i for i in range(num_seqs)]
+    # slot_mapping = torch.tensor(slot_mapping, dtype=torch.int, device="cuda")
+
+    # reference torch implementation
+    out_ref = torch.empty_like(query)
+    ref_single_query_cached_kv_attention(
+                out_ref,
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lens,
+            ),
+    
+    # triton implementation needs to partition size and shuffle the input
+    device = torch.cuda.device_of(query)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if B * num_kv_heads > 2 * num_sms:
+        num_splits = 1
+        partition_size = 0
+        if max_context_len >= 8192:
+            partition_size = max(split_size, block_size)
+            num_splits = triton.cdiv(max_context_len, partition_size)
+    else:
+        partition_size = max(split_size, block_size)
+        num_splits = triton.cdiv(max_context_len, partition_size)
+        if max_context_len <= 1024 or block_size >= 256:
+            num_splits = 1
+            partition_size = 0
+
+    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
+    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
+
+    # triton fma implementation
+    out_fma = torch.empty_like(query)
+    paged_attn_wo_mma(
+                out_fma,
+                query,
+                key_cache_tri,
+                value_cache_tri,
+                context_lens,
+                block_tables,
+                scale,
+                max_context_len,
+                num_splits,
+                partition_size,
+                device,
+            )
+
+    # triton implementation without unrolling
+    out_mma_no_unrolling = torch.empty_like(query)
+    paged_attn_w_mma(
+                out_mma_no_unrolling,
+                query,
+                key_cache_tri,
+                value_cache_tri,
+                context_lens,
+                block_tables,
+                scale,
+                max_context_len,
+                num_splits,
+                partition_size,
+                device,
+            )
+
+
+    # triton implementation with unrolling2
+    # out_mma_unrolling2 = torch.empty_like(query)
+    # paged_attn_w_mma_unroll2(
+    #     out_mma_unrolling2,
+    #     query,
+    #     key_cache_tri,
+    #     value_cache_tri,
+    #     context_lens,
+    #     block_tables,
+    #     scale,
+    #     max_context_len,
+    #     num_splits=triton.cdiv(max_context_len, partition_size),
+    #     partition_size=partition_size,
+    #     device=torch.cuda.device_of(query),
+    # )
+
+
+    # triton implementation with unrolling4
+    out_mma_unrolling4 = torch.empty_like(query)
+    print(f"partition_size = {partition_size}")
+    # paged_attn_w_mma_unrolling4(
+    #     out_mma_unrolling4,
+    #     query,
+    #     key_cache_tri,
+    #     value_cache_tri,
+    #     context_lens,
+    #     block_tables,
+    #     scale,
+    #     max_context_len,
+    #     num_splits=triton.cdiv(max_context_len, partition_size),
+    #     partition_size=partition_size,
+    #     device=torch.cuda.device_of(query),
+    # )
+    paged_attn_w_mma_unrolling4(
+        out_mma_unrolling4,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        scale,
+        max_context_len,
+        num_splits,
+        partition_size,
+        device,
+    )
+
+
+    # hip customized implementation
+    out_customized_hip = torch.empty_like(query)
+    # fixed split_size 256, cannot change
+    PARTITION_SIZE = 256
+    num_partitions = (max_context_len + PARTITION_SIZE - 1) // PARTITION_SIZE
+    tmp_output = torch.empty(
+        size=(B, num_q_heads, num_partitions, head_size),
+        dtype=out_customized_hip.dtype,
+        device=out_customized_hip.device,
+    )
+    exp_sums = torch.empty(
+        size=(B, num_q_heads, num_partitions),
+        dtype=torch.float32,
+        device=out_customized_hip.device,
+    )
+    max_logits = torch.empty_like(exp_sums)
+    paged_attention_custom(
+                    out_customized_hip,
+                    exp_sums,
+                    max_logits,
+                    tmp_output,
+                    query,
+                    key_cache,
+                    value_cache,
+                    num_kv_heads,
+                    scale,
+                    block_tables,
+                    context_lens,
+                    block_size,
+                    max_context_len,
+                    None,
+                    "auto",
+                )    
+
+    assert torch.allclose(out_ref, out_fma, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(out_ref, out_mma_no_unrolling, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(out_ref, out_mma_unrolling4, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(out_ref, out_customized_hip, atol=1e-2, rtol=1e-2)
