@@ -186,7 +186,7 @@ def paged_attn_w_mma(
     configs=[
         triton.Config({}, num_stages=stages, num_warps=warps)
         for stages in [0, 1, 3, 4]
-        for warps in [4, 8, 16]
+        for warps in [1, 2, 4, 8, 16]
     ],
     key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
 )
@@ -262,7 +262,7 @@ def _paged_attn_w_mma_kernel(
     group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
     # q: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
     q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
-    q = (q * attn_scale).to(q_ptr.dtype.element_ty)
+    q = (q * attn_scale * log2e).to(q_ptr.dtype.element_ty)
 
     m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
@@ -295,8 +295,8 @@ def _paged_attn_w_mma_kernel(
         m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
 
         # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-        p = tl.math.exp2((qk - m_i_new[:, None]) * log2e)
-        alpha = tl.math.exp2((m_i - m_i_new) * log2e)
+        p = tl.math.exp2((qk - m_i_new[:, None]))
+        alpha = tl.math.exp2((m_i - m_i_new))
         acc *= alpha[:, None]
 
         # v: [KV_BLOCK_SIZE, HEAD_SIZE]
@@ -310,7 +310,8 @@ def _paged_attn_w_mma_kernel(
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_i_new
-    acc = acc / l_i[:, None]
+    l_recip = 1 / l_i
+    acc = acc * l_recip[:, None]
 
     if USE_PARTITIONING:
         part_offset = (
@@ -609,7 +610,7 @@ def paged_attn_w_mma_unrolling4(
     configs=[
         triton.Config({}, num_stages=stages, num_warps=warps)
         for stages in [0, 1, 3, 4]
-        for warps in [4, 8, 16]
+        for warps in [1, 2, 4, 8, 16]
     ],
     key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
 )

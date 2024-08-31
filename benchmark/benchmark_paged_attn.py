@@ -120,8 +120,10 @@ test_cases = [
 (64, 16384, 32, 4),
 ]
 
-input_block_size = 16
-input_block_num = 10240
+input_block_size = 64
+total_size = 16 * 10240
+input_block_num = total_size // input_block_size
+split_size = 256
 
 configs.append(
     triton.testing.Benchmark(
@@ -147,7 +149,7 @@ configs.append(
             ("purple", "-"),
         ],
         ylabel="ms",
-        plot_name=f"head_size=128, block_size={input_block_size},num_blocks=2560",
+        plot_name=f"head_size=128, block_size={input_block_size},num_blocks={input_block_num}, partiton_size = {split_size}",
         args={
             "head_size": 128,
             "block_size": input_block_size,
@@ -233,10 +235,10 @@ def benchmark(
             num_splits = 1
             partition_size = 0
             if max_context_len >= 8192:
-                partition_size = max(256, block_size)
+                partition_size = max(split_size, block_size)
                 num_splits = triton.cdiv(max_context_len, partition_size)
         else:
-            partition_size = max(256, block_size)
+            partition_size = max(split_size, block_size)
             num_splits = triton.cdiv(max_context_len, partition_size)
             if max_context_len <= 1024 or block_size >= 256:
                 num_splits = 1
