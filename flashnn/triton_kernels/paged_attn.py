@@ -185,7 +185,7 @@ def paged_attn_w_mma(
 @triton.autotune(
     configs=[
         triton.Config({}, num_stages=stages, num_warps=warps)
-        for stages in [0, 1, 3, 4]
+        for stages in [1]
         for warps in [1, 2, 4, 8, 16]
     ],
     key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
@@ -609,7 +609,7 @@ def paged_attn_w_mma_unrolling4(
 @triton.autotune(
     configs=[
         triton.Config({}, num_stages=stages, num_warps=warps)
-        for stages in [0, 1, 3, 4]
+        for stages in [1]
         for warps in [1, 2, 4, 8, 16]
     ],
     key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
