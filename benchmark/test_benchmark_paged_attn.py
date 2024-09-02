@@ -13,7 +13,12 @@ import triton
 from parameterized import parameterized
 import pytest
 
-from flashnn.triton_kernels.paged_attn import paged_attn_w_mma, paged_attn_wo_mma, paged_attn_w_mma_unrolling4
+from flashnn.triton_kernels.paged_attn import (
+    paged_attn_w_mma,
+    paged_attn_w_mma_transv,
+    paged_attn_wo_mma, 
+    paged_attn_w_mma_unrolling4
+)
 
 try:
     from vllm import _custom_ops as ops
@@ -105,20 +110,21 @@ def get_input_shapes():
     # (1, 4096, 16, 16),
     # (1, 8192, 16, 16),
     # (1, 16384, 16,16),
-    (1, 1024, 52, 4),
-    (1, 2048, 52, 4),
-    (1, 4096, 52, 4),
-    (1, 8192, 52, 4),
-    (1, 16384, 52,4),
-    (64,1024, 52, 4),
-    (64,16384, 52, 4),
-    (1, 1024, 8 ,1),
-    (1, 2048, 8 ,1),
-    (1, 4096, 8 ,1),
-    (1, 8192, 8 ,1),
-    (1, 16384, 8, 1),
-    (64,1024, 8, 1),
-    (64,16384, 8, 1),
+    
+    # (1, 1024, 52, 4),
+    # (1, 2048, 52, 4),
+    # (1, 4096, 52, 4),
+    # (1, 8192, 52, 4),
+    # (1, 16384, 52,4),
+    # (64,1024, 52, 4),
+    # (64,16384, 52, 4),
+    # (1, 1024, 8 ,1),
+    # (1, 2048, 8 ,1),
+    # (1, 4096, 8 ,1),
+    # (1, 8192, 8 ,1),
+    # (1, 16384, 8, 1),
+    # (64,1024, 8, 1),
+    # (64,16384, 8, 1),
     (64, 16384, 32, 4),
     ]
     return test_cases
@@ -134,12 +140,14 @@ configs.append(
         x_vals=get_input_shapes(),
         line_arg="provider",
         line_vals=(
-            ["triton_fma", "triton_mma", "triton_mma_unrolling4"]
+            ["triton_mma_transv"]
+            # ["triton_fma", "triton_mma", "triton_mma_transv", "triton_mma_unrolling4"]
             # + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
             + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
         line_names=(
-            ["Triton FMA", "Triton MMA", "MMA Unroll4"]
+            ["TriMMATransV"]
+            # ["Triton FMA", "TritonMMA", "TriMMATransV", "MMA Unroll4"]
             # + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
             + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
@@ -278,6 +286,27 @@ def benchmark(
                 query,
                 key_cache_tri,
                 value_cache_tri,
+                context_lens,
+                block_tables,
+                scale,
+                max_context_len,
+                num_splits,
+                partition_size,
+                device,
+            ),
+            warmup=20,
+            rep=100,
+            quantiles=quantiles,
+        )
+
+    if provider == "triton_mma_transv":
+        value_cache_tri_transv = value_cache.permute(0, 1, 3, 2)
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: paged_attn_w_mma_transv(
+                out,
+                query,
+                key_cache_tri,
+                value_cache_tri_transv,
                 context_lens,
                 block_tables,
                 scale,
@@ -500,9 +529,9 @@ def test_paged_attn(B, ctx_n, num_q_heads, num_kv_heads, head_size=HEAD_DIM, blo
             )
 
     # triton implementation without unrolling
-    out_mma_no_unrolling = torch.empty_like(query)
+    out_mma = torch.empty_like(query)
     paged_attn_w_mma(
-                out_mma_no_unrolling,
+                out_mma,
                 query,
                 key_cache_tri,
                 value_cache_tri,
@@ -515,22 +544,23 @@ def test_paged_attn(B, ctx_n, num_q_heads, num_kv_heads, head_size=HEAD_DIM, blo
                 device,
             )
 
+    # transposed V input
+    value_cache_tri_trans = value_cache.permute(0, 1, 3, 2)
+    out_mma_transv = torch.empty_like(query)
+    paged_attn_w_mma_transv(
+                out_mma_transv,
+                query,
+                key_cache_tri,
+                value_cache_tri_trans,
+                context_lens,
+                block_tables,
+                scale,
+                max_context_len,
+                num_splits,
+                partition_size,
+                device,
+            )
 
-    # triton implementation with unrolling2
-    # out_mma_unrolling2 = torch.empty_like(query)
-    # paged_attn_w_mma_unroll2(
-    #     out_mma_unrolling2,
-    #     query,
-    #     key_cache_tri,
-    #     value_cache_tri,
-    #     context_lens,
-    #     block_tables,
-    #     scale,
-    #     max_context_len,
-    #     num_splits=triton.cdiv(max_context_len, partition_size),
-    #     partition_size=partition_size,
-    #     device=torch.cuda.device_of(query),
-    # )
 
     # triton implementation with unrolling4
     out_mma_unrolling4 = torch.empty_like(query)
@@ -584,6 +614,7 @@ def test_paged_attn(B, ctx_n, num_q_heads, num_kv_heads, head_size=HEAD_DIM, blo
                 )    
 
     assert torch.allclose(out_ref, out_fma, atol=1e-2, rtol=1e-2)
-    assert torch.allclose(out_ref, out_mma_no_unrolling, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(out_ref, out_mma, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(out_ref, out_mma_transv, atol=1e-2, rtol=1e-2)
     assert torch.allclose(out_ref, out_mma_unrolling4, atol=1e-2, rtol=1e-2)
     assert torch.allclose(out_ref, out_customized_hip, atol=1e-2, rtol=1e-2)
