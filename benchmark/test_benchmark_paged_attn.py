@@ -131,7 +131,7 @@ def get_input_shapes():
     return test_cases
 
 total_slots = 16 * 10240
-input_block_size = 16
+input_block_size = 64
 input_block_num = total_slots // input_block_size
 split_size = 256
 
