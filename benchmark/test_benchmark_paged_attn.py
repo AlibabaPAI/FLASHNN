@@ -17,7 +17,8 @@ from flashnn.triton_kernels.paged_attn import (
     paged_attn_w_mma,
     paged_attn_w_mma_transv,
     paged_attn_wo_mma, 
-    paged_attn_w_mma_unrolling4
+    paged_attn_w_mma_unrolling2,
+    paged_attn_w_mma_unrolling4,
 )
 
 try:
@@ -111,26 +112,26 @@ def get_input_shapes():
     # (1, 8192, 16, 16),
     # (1, 16384, 16,16),
     
-    # (1, 1024, 52, 4),
-    # (1, 2048, 52, 4),
-    # (1, 4096, 52, 4),
-    # (1, 8192, 52, 4),
-    # (1, 16384, 52,4),
-    # (64,1024, 52, 4),
-    # (64,16384, 52, 4),
-    # (1, 1024, 8 ,1),
-    # (1, 2048, 8 ,1),
-    # (1, 4096, 8 ,1),
-    # (1, 8192, 8 ,1),
-    # (1, 16384, 8, 1),
-    # (64,1024, 8, 1),
-    # (64,16384, 8, 1),
+    (1, 1024, 52, 4),
+    (1, 2048, 52, 4),
+    (1, 4096, 52, 4),
+    (1, 8192, 52, 4),
+    (1, 16384, 52,4),
+    (64,1024, 52, 4),
+    (64,16384, 52, 4),
+    (1, 1024, 8 ,1),
+    (1, 2048, 8 ,1),
+    (1, 4096, 8 ,1),
+    (1, 8192, 8 ,1),
+    (1, 16384, 8, 1),
+    (64,1024, 8, 1),
+    (64,16384, 8, 1),
     (64, 16384, 32, 4),
     ]
     return test_cases
 
 total_slots = 16 * 10240
-input_block_size = 64
+input_block_size = 16
 input_block_num = total_slots // input_block_size
 split_size = 256
 
@@ -140,14 +141,14 @@ configs.append(
         x_vals=get_input_shapes(),
         line_arg="provider",
         line_vals=(
-            ["triton_mma_transv"]
-            # ["triton_fma", "triton_mma", "triton_mma_transv", "triton_mma_unrolling4"]
+            # ["triton_mma", "triton_mma_transv"]
+            ["triton_fma", "triton_mma", "triton_mma_transv", "triton_mma_unrolling2", "triton_mma_unrolling4"]
             # + (["vllm_v1", "vllm_v2"] if HAS_VLLM else [])
             + (["vllm_custom"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
         line_names=(
-            ["TriMMATransV"]
-            # ["Triton FMA", "TritonMMA", "TriMMATransV", "MMA Unroll4"]
+            # ["TritonMMA", "TriMMATransV"]
+            ["Triton FMA", "TritonMMA", "TriMMATransV", "MMA Unroll2", "MMA Unroll4"]
             # + (["vLLM_V1", "vLLM_V2"] if HAS_VLLM else [])
             + (["vLLM_CUSTOM"] if HAS_VLLM_CUSTOM_PAGED else [])
         ),
@@ -323,6 +324,26 @@ def benchmark(
     if provider == "triton_mma_unrolling4":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: paged_attn_w_mma_unrolling4(
+                out,
+                query,
+                key_cache_tri,
+                value_cache_tri,
+                context_lens,
+                block_tables,
+                scale,
+                max_context_len,
+                num_splits,
+                partition_size,
+                device,
+            ),
+            warmup=20,
+            rep=100,
+            quantiles=quantiles,
+        )
+
+    if provider == "triton_mma_unrolling2":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: paged_attn_w_mma_unrolling2(
                 out,
                 query,
                 key_cache_tri,
