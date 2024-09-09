@@ -74,97 +74,6 @@ def paged_attention(
         paged_attn_w_mma(*kwargs)
 
 
-def paged_attn_wo_mma(
-    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
-    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
-    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
-    context_lens: torch.Tensor,  # [num_seqs]
-    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
-    attn_scale: float,
-    max_context_len: int,
-    num_splits: int,
-    partition_size: int,
-    device,
-    alibi_slope: torch.Tensor = None,
-) -> None:
-    num_seqs = query.shape[0]
-    num_q_heads = query.shape[1]
-    num_kv_heads = key_cache.shape[1]
-    kv_block_size = key_cache.shape[2]
-    head_size = key_cache.shape[3]
-    query_group_size = num_q_heads // num_kv_heads
-
-    with torch.cuda.device(device):
-        shape_info = (num_seqs, num_q_heads, num_splits)
-        exp_sums = torch.empty(size=shape_info, dtype=torch.float32, device="cuda")
-        max_logits = torch.empty(size=shape_info, dtype=torch.float32, device="cuda")
-        if num_splits == 1:
-            tmp_out = out
-        else:
-            tmp_out = torch.empty(
-                (*shape_info, head_size), dtype=torch.float32, device="cuda"
-            )
-        kwargs = [
-            exp_sums,
-            max_logits,
-            tmp_out,
-            query,
-            key_cache,
-            value_cache,
-            attn_scale,
-            block_tables,
-            context_lens,
-            block_tables.shape[1],
-            alibi_slope,
-            query.stride(0),
-            query.stride(1),
-            tmp_out.stride(0),
-            tmp_out.stride(1),
-            tmp_out.stride(2),
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            exp_sums.stride(0),
-            exp_sums.stride(1),
-        ]
-        grid = (num_q_heads, num_seqs, num_splits)
-        const_kwargs = {
-            "BLOCK_SIZE": kv_block_size,
-            "HEAD_SIZE": head_size,
-            "QUERY_GROUP_SIZE": query_group_size,
-            "PARTITION_SIZE": 0 if num_splits == 1 else partition_size,
-            "POWER_OF_2_MAX_SEQ_LEN": triton.next_power_of_2(max_context_len),
-            "USE_PARTITIONING": False if num_splits == 1 else True,
-        }
-        _paged_attn_wo_mma_kernel[grid](*kwargs, **const_kwargs)
-
-        if num_splits != 1:
-            # reduction across partitions
-            padded_num_splits = triton.next_power_of_2(num_splits)
-            kwargs = [
-                out,
-                exp_sums,
-                max_logits,
-                tmp_out,
-                context_lens,
-                exp_sums.stride(0),
-                exp_sums.stride(1),
-                out.stride(0),
-                out.stride(1),
-                tmp_out.stride(0),
-                tmp_out.stride(1),
-                tmp_out.stride(2),
-            ]
-            reduce_grid = (num_q_heads, num_seqs, 1)
-            const_kwargs = {
-                "HEAD_SIZE": head_size,
-                "PADDED_NUM_SPLITS": padded_num_splits,
-                "PARTITION_SIZE": partition_size,
-            }
-            _paged_attn_wo_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
-
-
 def paged_attn_w_mma(
     out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
     query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
@@ -276,8 +185,8 @@ def paged_attn_w_mma(
 @triton.autotune(
     configs=[
         triton.Config({}, num_stages=stages, num_warps=warps)
-        for stages in [0, 1, 3, 4]
-        for warps in [4, 8, 16]
+        for stages in [0, 1]
+        for warps in [1, 2, 4, 8, 16]
     ],
     key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
 )
@@ -353,7 +262,7 @@ def _paged_attn_w_mma_kernel(
     group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
     # q: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
     q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
-    q = (q * attn_scale).to(q_ptr.dtype.element_ty)
+    q = (q * attn_scale * log2e).to(q_ptr.dtype.element_ty)
 
     m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
@@ -369,16 +278,16 @@ def _paged_attn_w_mma_kernel(
         # Load a key block.
         kv_block_offset = block_number * stride_kv0 + kv_offset
         mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
-        kv_mask = mask_offset[:, None] < context_len
+        # kv_mask = mask_offset[:, None] < context_len
 
         # k: [KV_BLOCK_SIZE, HEAD_SIZE]
-        k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
+        k = tl.load(k_cache_ptr + kv_block_offset)
 
         # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-        if PADDED_QUERY_GROUP_SIZE == 1:
-            qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
-        else:
-            qk = tl.dot(q, k.T, out_dtype=tl.float32)
+        # if PADDED_QUERY_GROUP_SIZE == 1:
+        #     qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
+        # else:
+        qk = tl.dot(q, k.T, out_dtype=tl.float32)
 
         # qk *= attn_scale
         qk = tl.where(mask_offset < context_len, qk, float("-inf"))
@@ -386,22 +295,1129 @@ def _paged_attn_w_mma_kernel(
         m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
 
         # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
-        p = tl.math.exp2((qk - m_i_new[:, None]) * log2e)
-        alpha = tl.math.exp2((m_i - m_i_new) * log2e)
+        p = tl.math.exp2((qk - m_i_new[:, None]))
+        alpha = tl.math.exp2((m_i - m_i_new))
+        acc *= alpha[:, None]
+
+        # v: [KV_BLOCK_SIZE, HEAD_SIZE]
+        v = tl.load(v_cache_ptr + kv_block_offset)
+
+        # if PADDED_QUERY_GROUP_SIZE == 1:
+        #     acc += tl.sum(p.T[:, :, None] * v[:, None, :], axis=0)
+        # else:
+        p = p.to(v.dtype)
+        acc += tl.dot(p, v, out_dtype=tl.float32)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+    l_recip = 1 / l_i
+    acc = acc * l_recip[:, None]
+
+    if USE_PARTITIONING:
+        part_offset = (
+            (seq_idx * NUM_KV_HEADS + kv_head_idx)
+            * max_num_partitions
+            * QUERY_GROUP_SIZE
+            + part_idx * QUERY_GROUP_SIZE
+            + padding_group_offset
+        )
+        mask = padding_group_offset < QUERY_GROUP_SIZE
+        tl.store(m_i_ptr + part_offset, m_i, mask=mask)
+        tl.store(l_i_ptr + part_offset, l_i, mask=mask)
+
+    out_offset = seq_idx * stride_o0
+    if USE_PARTITIONING:
+        out_offset += kv_head_idx * stride_o1
+    else:
+        out_offset += kv_head_idx * QUERY_GROUP_SIZE * stride_o1
+    out_offset += (
+        part_idx * stride_o2
+        + padding_group_offset[:, None] * stride_o3
+        + head_offset[None, :] * stride_o4
+    )
+
+    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
+    tl.store(out_ptr + out_offset, acc, mask=group_mask)
+
+
+# Requires triton >= 2.2.0
+def paged_attention_transv(
+    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, HEAD_SIZE, KV_BLOCK_SIZE], required same stride with key_cache
+    context_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale: float,
+    max_context_len: int,
+    num_splits: int = 0,
+    alibi_slope: torch.Tensor = None,
+) -> None:
+    num_seqs = query.shape[0]
+    num_kv_heads = key_cache.shape[1]
+    kv_block_size = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    query_group_size = query.shape[1] // num_kv_heads
+
+    assert head_size in (16, 32, 64, 128, 256, 512), f"head_size={head_size}"
+    assert (
+        query_group_size == 1 or kv_block_size >= 16
+    ), f"kv_block_size={kv_block_size}"
+    # query_group_size in (1, 2, 4, 8, 16, 32, 64, 128, 256)
+    # assert query_group_size > 0 and query_group_size & (query_group_size-1) == 0, f"query_group_size={query_group_size}"
+
+    # config for A100
+    # TODO: support more devices and optimize
+    device = torch.cuda.device_of(query)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if num_splits == 0:
+        if num_seqs * num_kv_heads > 2 * num_sms:
+            num_splits = 1
+            partition_size = 0
+            if max_context_len >= 8192:
+                partition_size = max(512, kv_block_size)
+                num_splits = triton.cdiv(max_context_len, partition_size)
+        else:
+            partition_size = max(512, kv_block_size)
+            num_splits = triton.cdiv(max_context_len, partition_size)
+            if max_context_len <= 1024 or kv_block_size >= 256:
+                num_splits = 1
+                partition_size = 0
+    # User hint
+    elif num_splits > 1:
+        partition_size = triton.cdiv(max_context_len, num_splits)
+        partition_size = triton.next_power_of_2(partition_size)
+    kwargs = [
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        attn_scale,
+        max_context_len,
+        num_splits,
+        partition_size,
+        device,
+        alibi_slope,
+    ]
+    if query_group_size == 1:
+        paged_attn_wo_mma(*kwargs)
+    else:
+        # paged_attn_w_mma(*kwargs)
+        paged_attn_w_mma_transv(*kwargs)
+
+
+def paged_attn_w_mma_transv(
+    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    context_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale: float,
+    max_context_len: int,
+    num_splits: int,
+    partition_size: int,
+    device,
+    alibi_slope: torch.Tensor = None,
+) -> None:
+    num_seqs = query.shape[0]
+    num_kv_heads = key_cache.shape[1]
+    kv_block_size = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    query_group_size = query.shape[1] // num_kv_heads
+    if query_group_size == 1:
+        padded_group_size = 1
+    elif query_group_size < 16:
+        padded_group_size = 16
+    else:
+        padded_group_size = triton.next_power_of_2(query_group_size)
+
+    with torch.cuda.device(device):
+        assert alibi_slope is None
+        grid = (num_seqs, num_kv_heads, num_splits)
+        shape_info = (num_seqs, num_kv_heads, num_splits, query_group_size)
+        m_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
+        l_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
+        tmp_out = torch.empty(
+            size=(*shape_info, head_size), dtype=out.dtype, device=out.device
+        )
+        kwargs = [
+            m_i,
+            l_i,
+            out if num_splits == 1 else tmp_out,
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+            attn_scale,
+            block_tables.stride(0),
+            block_tables.stride(1),
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            value_cache.stride(3),
+        ]
+        if num_splits == 1:
+            kwargs += [
+                out.stride(0),
+                out.stride(1),
+                out.stride(1),
+                out.stride(1),
+                out.stride(2),
+            ]
+        else:
+            kwargs += [
+                tmp_out.stride(0),
+                tmp_out.stride(1),
+                tmp_out.stride(2),
+                tmp_out.stride(3),
+                tmp_out.stride(4),
+            ]
+        const_kwargs = {
+            "HEAD_SIZE": head_size,
+            "QUERY_GROUP_SIZE": query_group_size,
+            "PADDED_QUERY_GROUP_SIZE": padded_group_size,
+            "NUM_KV_HEADS": num_kv_heads,
+            "KV_BLOCK_SIZE": kv_block_size,
+            "PARTITION_SIZE": partition_size,
+        }
+        _paged_attn_w_mma_kernel_transv[grid](*kwargs, **const_kwargs)
+        # print(f"_paged_attn_w_mma_kernel_transv_best_config = {_paged_attn_w_mma_kernel_transv.best_config}")
+
+        if num_splits != 1:
+            assert (partition_size >= kv_block_size) and (
+                partition_size % kv_block_size == 0
+            ), f"partition_size={partition_size}, kv_block_size={kv_block_size}"
+            reduce_grid = (num_seqs, num_kv_heads, 1)
+            kwargs = [
+                out,
+                m_i,
+                l_i,
+                tmp_out,
+                context_lens,
+                num_splits,
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+            ]
+            const_kwargs = {
+                "HEAD_SIZE": head_size,
+                "QUERY_GROUP_SIZE": query_group_size,
+                "PADDED_QUERY_GROUP_SIZE": padded_group_size,
+                "NUM_KV_HEADS": num_kv_heads,
+                "PARTITION_SIZE": partition_size,
+                "NUM_PARTITIONS": triton.next_power_of_2(num_splits),
+            }
+            _paged_attn_w_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=stages, num_warps=warps)
+        for stages in [0, 1]
+        for warps in [1, 2, 4, 8, 16]
+    ],
+    key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
+)
+@triton.jit
+def _paged_attn_w_mma_kernel_transv(
+    m_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
+    l_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
+    out_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
+    q_ptr,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    k_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    v_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], change the V layout
+    context_lens_ptr,  # [num_seqs]
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale,
+    stride_bt0,
+    stride_bt1,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_k3,
+    stride_v0,
+    stride_v1,
+    stride_v2,
+    stride_v3,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    stride_o3,
+    stride_o4,
+    HEAD_SIZE: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+    PARTITION_SIZE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    part_idx = tl.program_id(2)
+    max_num_partitions = tl.num_programs(2)
+
+    # scale sm_scale by log_2(e) and use
+    # 2^x instead of exp in the loop because CSE and LICM
+    # don't work as expected with `exp` in the loop
+    log2e: tl.constexpr = 1.4426950408889634
+
+    USE_PARTITIONING = PARTITION_SIZE > 0
+    context_len = tl.load(context_lens_ptr + seq_idx)
+    if USE_PARTITIONING:
+        context_start_idx = part_idx * PARTITION_SIZE
+        if context_start_idx >= context_len:
+            return
+        context_end_idx = tl.minimum(context_start_idx + PARTITION_SIZE, context_len)
+        num_blocks = tl.cdiv(context_end_idx - context_start_idx, KV_BLOCK_SIZE)
+    else:
+        num_blocks = tl.cdiv(context_len, KV_BLOCK_SIZE)
+
+    block_offset = tl.arange(0, KV_BLOCK_SIZE)
+    head_offset = tl.arange(0, HEAD_SIZE)
+    padding_group_offset = tl.arange(0, PADDED_QUERY_GROUP_SIZE)
+
+    k_offset = (
+        kv_head_idx * stride_k1
+        + block_offset[:, None] * stride_k2
+        + head_offset[None, :] * stride_k3
+    )
+    v_offset = (
+        kv_head_idx * stride_v1
+        + block_offset[:, None] * stride_v2
+        + head_offset[None, :] * stride_v3
+    )
+
+    # Load queries.
+    q_offset = (
+        seq_idx * stride_q0
+        + (kv_head_idx * QUERY_GROUP_SIZE + padding_group_offset[:, None]) * stride_q1
+        + head_offset[None, :] * stride_q2
+    )
+    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
+    # q: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
+    q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
+    q = (q * attn_scale * log2e).to(q_ptr.dtype.element_ty)
+
+    m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
+    acc = tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
+
+    num_prev_blocks = part_idx * (PARTITION_SIZE // KV_BLOCK_SIZE)
+    for i in range(num_blocks):
+        block_idx = num_prev_blocks + i
+        block_number = tl.load(
+            block_tables_ptr + seq_idx * stride_bt0 + block_idx * stride_bt1
+        )
+
+        # Load a key block.
+        k_block_offset = block_number * stride_k0 + k_offset
+        mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
+        kv_mask = mask_offset[:, None] < context_len
+
+        # k: [KV_BLOCK_SIZE, HEAD_SIZE]
+        # k = tl.load(k_cache_ptr + k_block_offset, mask=kv_mask, other=0.0)
+        k = tl.load(k_cache_ptr + k_block_offset)
+
+        # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        # if PADDED_QUERY_GROUP_SIZE == 1:
+        #     qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
+        # else:
+        qk = tl.dot(q, k.T, out_dtype=tl.float32)
+
+        # qk *= attn_scale
+        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
+
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
+
+        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        p = tl.math.exp2((qk - m_i_new[:, None]))
+        alpha = tl.math.exp2((m_i - m_i_new))
+        acc *= alpha[:, None]
+
+        # v: [KV_BLOCK_SIZE, HEAD_SIZE]
+        v_block_offset = block_number * stride_v0 + v_offset
+        # v = tl.load(v_cache_ptr + v_block_offset, mask=kv_mask, other=0.0)
+        v = tl.load(v_cache_ptr + v_block_offset)
+
+        # if PADDED_QUERY_GROUP_SIZE == 1:
+        #     acc += tl.sum(p.T[:, :, None] * v[:, None, :], axis=0)
+        # else:
+        p = p.to(v.dtype)
+        acc += tl.dot(p, v, out_dtype=tl.float32)
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_i_new
+    l_recip = 1 / l_i
+    acc = acc * l_recip[:, None]
+
+    if USE_PARTITIONING:
+        part_offset = (
+            (seq_idx * NUM_KV_HEADS + kv_head_idx)
+            * max_num_partitions
+            * QUERY_GROUP_SIZE
+            + part_idx * QUERY_GROUP_SIZE
+            + padding_group_offset
+        )
+        mask = padding_group_offset < QUERY_GROUP_SIZE
+        tl.store(m_i_ptr + part_offset, m_i, mask=mask)
+        tl.store(l_i_ptr + part_offset, l_i, mask=mask)
+
+    out_offset = seq_idx * stride_o0
+    if USE_PARTITIONING:
+        out_offset += kv_head_idx * stride_o1
+    else:
+        out_offset += kv_head_idx * QUERY_GROUP_SIZE * stride_o1
+    out_offset += (
+        part_idx * stride_o2
+        + padding_group_offset[:, None] * stride_o3
+        + head_offset[None, :] * stride_o4
+    )
+
+    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
+    tl.store(out_ptr + out_offset, acc, mask=group_mask)
+
+
+# Requires triton >= 2.2.0
+def paged_attention_unrolling4(
+    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    context_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale: float,
+    max_context_len: int,
+    num_splits: int = 0,
+    alibi_slope: torch.Tensor = None,
+) -> None:
+    num_seqs = query.shape[0]
+    num_kv_heads = key_cache.shape[1]
+    kv_block_size = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    query_group_size = query.shape[1] // num_kv_heads
+
+    assert head_size in (16, 32, 64, 128, 256, 512), f"head_size={head_size}"
+    assert (
+        query_group_size == 1 or kv_block_size >= 16
+    ), f"kv_block_size={kv_block_size}"
+    # query_group_size in (1, 2, 4, 8, 16, 32, 64, 128, 256)
+    # assert query_group_size > 0 and query_group_size & (query_group_size-1) == 0, f"query_group_size={query_group_size}"
+
+    # config for A100
+    # TODO: support more devices and optimize
+    device = torch.cuda.device_of(query)
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if num_splits == 0:
+        if num_seqs * num_kv_heads > 2 * num_sms:
+            num_splits = 1
+            partition_size = 0
+            if max_context_len >= 8192:
+                partition_size = max(512, kv_block_size)
+                num_splits = triton.cdiv(max_context_len, partition_size)
+        else:
+            partition_size = max(512, kv_block_size)
+            num_splits = triton.cdiv(max_context_len, partition_size)
+            if max_context_len <= 1024 or kv_block_size >= 256:
+                num_splits = 1
+                partition_size = 0
+    # User hint
+    elif num_splits > 1:
+        partition_size = triton.cdiv(max_context_len, num_splits)
+        partition_size = triton.next_power_of_2(partition_size)
+    kwargs = [
+        out,
+        query,
+        key_cache,
+        value_cache,
+        context_lens,
+        block_tables,
+        attn_scale,
+        max_context_len,
+        num_splits,
+        partition_size,
+        device,
+        alibi_slope,
+    ]
+    if query_group_size == 1:
+        paged_attn_wo_mma(*kwargs)
+    else:
+        paged_attn_w_mma_unrolling4(*kwargs)
+
+
+def paged_attn_wo_mma(
+    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    context_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale: float,
+    max_context_len: int,
+    num_splits: int,
+    partition_size: int,
+    device,
+    alibi_slope: torch.Tensor = None,
+) -> None:
+    num_seqs = query.shape[0]
+    num_q_heads = query.shape[1]
+    num_kv_heads = key_cache.shape[1]
+    kv_block_size = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    query_group_size = num_q_heads // num_kv_heads
+
+    with torch.cuda.device(device):
+        shape_info = (num_seqs, num_q_heads, num_splits)
+        exp_sums = torch.empty(size=shape_info, dtype=torch.float32, device="cuda")
+        max_logits = torch.empty(size=shape_info, dtype=torch.float32, device="cuda")
+        if num_splits == 1:
+            tmp_out = out
+        else:
+            tmp_out = torch.empty(
+                (*shape_info, head_size), dtype=torch.float32, device="cuda"
+            )
+        kwargs = [
+            exp_sums,
+            max_logits,
+            tmp_out,
+            query,
+            key_cache,
+            value_cache,
+            attn_scale,
+            block_tables,
+            context_lens,
+            block_tables.shape[1],
+            alibi_slope,
+            query.stride(0),
+            query.stride(1),
+            tmp_out.stride(0),
+            tmp_out.stride(1),
+            tmp_out.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            exp_sums.stride(0),
+            exp_sums.stride(1),
+        ]
+        grid = (num_q_heads, num_seqs, num_splits)
+        const_kwargs = {
+            "BLOCK_SIZE": kv_block_size,
+            "HEAD_SIZE": head_size,
+            "QUERY_GROUP_SIZE": query_group_size,
+            "PARTITION_SIZE": 0 if num_splits == 1 else partition_size,
+            "POWER_OF_2_MAX_SEQ_LEN": triton.next_power_of_2(max_context_len),
+            "USE_PARTITIONING": False if num_splits == 1 else True,
+        }
+        _paged_attn_wo_mma_kernel[grid](*kwargs, **const_kwargs)
+
+        if num_splits != 1:
+            # reduction across partitions
+            padded_num_splits = triton.next_power_of_2(num_splits)
+            kwargs = [
+                out,
+                exp_sums,
+                max_logits,
+                tmp_out,
+                context_lens,
+                exp_sums.stride(0),
+                exp_sums.stride(1),
+                out.stride(0),
+                out.stride(1),
+                tmp_out.stride(0),
+                tmp_out.stride(1),
+                tmp_out.stride(2),
+            ]
+            reduce_grid = (num_q_heads, num_seqs, 1)
+            const_kwargs = {
+                "HEAD_SIZE": head_size,
+                "PADDED_NUM_SPLITS": padded_num_splits,
+                "PARTITION_SIZE": partition_size,
+            }
+            _paged_attn_wo_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
+
+
+def paged_attn_w_mma_unrolling2(
+    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    context_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale: float,
+    max_context_len: int,
+    num_splits: int,
+    partition_size: int,
+    device,
+    alibi_slope: torch.Tensor = None,
+) -> None:
+    num_seqs = query.shape[0]
+    num_kv_heads = key_cache.shape[1]
+    kv_block_size = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    query_group_size = query.shape[1] // num_kv_heads
+    if query_group_size == 1:
+        padded_group_size = 1
+    elif query_group_size < 16:
+        padded_group_size = 16
+    else:
+        padded_group_size = triton.next_power_of_2(query_group_size)
+
+    with torch.cuda.device(device):
+        assert alibi_slope is None
+        grid = (num_seqs, num_kv_heads, num_splits)
+        shape_info = (num_seqs, num_kv_heads, num_splits, query_group_size)
+        m_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
+        l_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
+        tmp_out = torch.empty(
+            size=(*shape_info, head_size), dtype=out.dtype, device=out.device
+        )
+        kwargs = [
+            m_i,
+            l_i,
+            out if num_splits == 1 else tmp_out,
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+            attn_scale,
+            block_tables.stride(0),
+            block_tables.stride(1),
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+        ]
+        if num_splits == 1:
+            kwargs += [
+                out.stride(0),
+                out.stride(1),
+                out.stride(1),
+                out.stride(1),
+                out.stride(2),
+            ]
+        else:
+            kwargs += [
+                tmp_out.stride(0),
+                tmp_out.stride(1),
+                tmp_out.stride(2),
+                tmp_out.stride(3),
+                tmp_out.stride(4),
+            ]
+        const_kwargs = {
+            "HEAD_SIZE": head_size,
+            "QUERY_GROUP_SIZE": query_group_size,
+            "PADDED_QUERY_GROUP_SIZE": padded_group_size,
+            "NUM_KV_HEADS": num_kv_heads,
+            "KV_BLOCK_SIZE": kv_block_size,
+            "PARTITION_SIZE": partition_size,
+        }
+        _paged_attn_w_mma_kernel_unrolling2[grid](*kwargs, **const_kwargs)
+
+        if num_splits != 1:
+            assert (partition_size >= kv_block_size) and (
+                partition_size % kv_block_size == 0
+            ), f"partition_size={partition_size}, kv_block_size={kv_block_size}"
+            reduce_grid = (num_seqs, num_kv_heads, 1)
+            kwargs = [
+                out,
+                m_i,
+                l_i,
+                tmp_out,
+                context_lens,
+                num_splits,
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+            ]
+            const_kwargs = {
+                "HEAD_SIZE": head_size,
+                "QUERY_GROUP_SIZE": query_group_size,
+                "PADDED_QUERY_GROUP_SIZE": padded_group_size,
+                "NUM_KV_HEADS": num_kv_heads,
+                "PARTITION_SIZE": partition_size,
+                "NUM_PARTITIONS": triton.next_power_of_2(num_splits),
+            }
+            _paged_attn_w_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=stages, num_warps=warps)
+        for stages in [0, 1]
+        for warps in [1, 2, 4, 8, 16]
+    ],
+    key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
+)
+@triton.jit
+def _paged_attn_w_mma_kernel_unrolling2(
+    m_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
+    l_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
+    out_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
+    q_ptr,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    k_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    v_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    context_lens_ptr,  # [num_seqs]
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale,
+    stride_bt0,
+    stride_bt1,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_kv0,
+    stride_kv1,
+    stride_kv2,
+    stride_kv3,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    stride_o3,
+    stride_o4,
+    HEAD_SIZE: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+    PARTITION_SIZE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    part_idx = tl.program_id(2)
+    max_num_partitions = tl.num_programs(2)
+
+    # scale sm_scale by log_2(e) and use
+    # 2^x instead of exp in the loop because CSE and LICM
+    # don't work as expected with `exp` in the loop
+    log2e: tl.constexpr = 1.4426950408889634
+
+    USE_PARTITIONING = PARTITION_SIZE > 0
+    context_len = tl.load(context_lens_ptr + seq_idx)
+    if USE_PARTITIONING:
+        context_start_idx = part_idx * PARTITION_SIZE
+        if context_start_idx >= context_len:
+            return
+        context_end_idx = tl.minimum(context_start_idx + PARTITION_SIZE, context_len)
+        num_blocks = tl.cdiv(context_end_idx - context_start_idx, KV_BLOCK_SIZE)
+    else:
+        num_blocks = tl.cdiv(context_len, KV_BLOCK_SIZE)
+
+    block_offset = tl.arange(0, KV_BLOCK_SIZE)
+    head_offset = tl.arange(0, HEAD_SIZE)
+    padding_group_offset = tl.arange(0, PADDED_QUERY_GROUP_SIZE)
+
+    kv_offset = (
+        kv_head_idx * stride_kv1
+        + block_offset[:, None] * stride_kv2
+        + head_offset[None, :] * stride_kv3
+    )
+
+    # Load queries.
+    q_offset = (
+        seq_idx * stride_q0
+        + (kv_head_idx * QUERY_GROUP_SIZE + padding_group_offset[:, None]) * stride_q1
+        + head_offset[None, :] * stride_q2
+    )
+    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
+    # q: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
+    q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
+    q = (q * attn_scale * log2e).to(q_ptr.dtype.element_ty)
+
+    m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
+    acc = tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
+
+    num_prev_blocks = part_idx * (PARTITION_SIZE // KV_BLOCK_SIZE)
+    block_table_base = block_tables_ptr + seq_idx * stride_bt0
+    for i in range(0,num_blocks,2):
+        block_idx = num_prev_blocks + i
+        block_number = tl.load(
+            block_table_base + block_idx * stride_bt1
+        )
+        block_number1 = tl.load(
+            block_table_base + (block_idx + 1)* stride_bt1
+        )
+
+        # Load a key block.
+        kv_block_offset = block_number * stride_kv0 + kv_offset
+        kv_block_offset1 = block_number1 * stride_kv0 + kv_offset
+        mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
+        mask_offset1 = (block_idx + 1) * KV_BLOCK_SIZE + block_offset
+        # kv_mask = mask_offset[:, None] < context_len
+        # kv_mask1 = mask_offset1[:, None] < context_len
+
+        # k: [KV_BLOCK_SIZE, HEAD_SIZE]
+        # k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
+        # k1 = tl.load(k_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
+        k = tl.load(k_cache_ptr + kv_block_offset)
+        k1 = tl.load(k_cache_ptr + kv_block_offset1)
+
+        v = tl.load(v_cache_ptr + kv_block_offset)
+        v1 = tl.load(v_cache_ptr + kv_block_offset1)
+
+        # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        qk = tl.dot(q, k.T, out_dtype=tl.float32)
+        qk1 = tl.dot(q, k1.T, out_dtype=tl.float32)
+
+        # qk *= attn_scale
+        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
+        qk1 = tl.where(mask_offset1 < context_len, qk1, float("-inf"))
+
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_i_new = tl.maximum(m_i_new, tl.max(qk1, axis=1))
+
+        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        p = tl.math.exp2((qk - m_i_new[:, None]))
+        p1 = tl.math.exp2((qk1 - m_i_new[:, None]))
+        alpha = tl.math.exp2((m_i - m_i_new))
+        acc *= alpha[:, None]
+
+        # v: [KV_BLOCK_SIZE, HEAD_SIZE]
+        # v = tl.load(v_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
+        # v1 = tl.load(v_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
+
+        p = p.to(v.dtype)
+        p1 = p1.to(v.dtype)
+        acc += tl.dot(p, v, out_dtype=tl.float32) + tl.dot(p1, v1, out_dtype=tl.float32)
+        # acc += tl.dot(p1, v1, out_dtype=tl.float32)
+
+        l_i = l_i * alpha + tl.sum(p + p1, axis=1)
+        m_i = m_i_new
+    l_recip = 1 / l_i
+    acc = acc * l_recip[:, None]
+
+    if USE_PARTITIONING:
+        part_offset = (
+            (seq_idx * NUM_KV_HEADS + kv_head_idx)
+            * max_num_partitions
+            * QUERY_GROUP_SIZE
+            + part_idx * QUERY_GROUP_SIZE
+            + padding_group_offset
+        )
+        mask = padding_group_offset < QUERY_GROUP_SIZE
+        # tl.store(m_i_ptr + part_offset, m_i, mask=mask)
+        # tl.store(l_i_ptr + part_offset, l_i, mask=mask)
+        tl.store(m_i_ptr + part_offset, m_i, mask=mask)
+        tl.store(l_i_ptr + part_offset, l_i, mask=mask)
+
+    out_offset = seq_idx * stride_o0
+    if USE_PARTITIONING:
+        out_offset += kv_head_idx * stride_o1
+    else:
+        out_offset += kv_head_idx * QUERY_GROUP_SIZE * stride_o1
+    out_offset += (
+        part_idx * stride_o2
+        + padding_group_offset[:, None] * stride_o3
+        + head_offset[None, :] * stride_o4
+    )
+
+    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
+    tl.store(out_ptr + out_offset, acc, mask=group_mask)
+
+
+def paged_attn_w_mma_unrolling4(
+    out: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    query: torch.Tensor,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    key_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    value_cache: torch.Tensor,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE], required same stride with key_cache
+    context_lens: torch.Tensor,  # [num_seqs]
+    block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale: float,
+    max_context_len: int,
+    num_splits: int,
+    partition_size: int,
+    device,
+    alibi_slope: torch.Tensor = None,
+) -> None:
+    num_seqs = query.shape[0]
+    num_kv_heads = key_cache.shape[1]
+    kv_block_size = key_cache.shape[2]
+    head_size = key_cache.shape[3]
+    query_group_size = query.shape[1] // num_kv_heads
+    if query_group_size == 1:
+        padded_group_size = 1
+    elif query_group_size < 16:
+        padded_group_size = 16
+    else:
+        padded_group_size = triton.next_power_of_2(query_group_size)
+
+    with torch.cuda.device(device):
+        assert alibi_slope is None
+        grid = (num_seqs, num_kv_heads, num_splits)
+        shape_info = (num_seqs, num_kv_heads, num_splits, query_group_size)
+        m_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
+        l_i = torch.empty(size=shape_info, dtype=torch.float32, device=query.device)
+        tmp_out = torch.empty(
+            size=(*shape_info, head_size), dtype=out.dtype, device=out.device
+        )
+        kwargs = [
+            m_i,
+            l_i,
+            out if num_splits == 1 else tmp_out,
+            query,
+            key_cache,
+            value_cache,
+            context_lens,
+            block_tables,
+            attn_scale,
+            block_tables.stride(0),
+            block_tables.stride(1),
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.stride(3),
+        ]
+        if num_splits == 1:
+            kwargs += [
+                out.stride(0),
+                out.stride(1),
+                out.stride(1),
+                out.stride(1),
+                out.stride(2),
+            ]
+        else:
+            kwargs += [
+                tmp_out.stride(0),
+                tmp_out.stride(1),
+                tmp_out.stride(2),
+                tmp_out.stride(3),
+                tmp_out.stride(4),
+            ]
+        const_kwargs = {
+            "HEAD_SIZE": head_size,
+            "QUERY_GROUP_SIZE": query_group_size,
+            "PADDED_QUERY_GROUP_SIZE": padded_group_size,
+            "NUM_KV_HEADS": num_kv_heads,
+            "KV_BLOCK_SIZE": kv_block_size,
+            "PARTITION_SIZE": partition_size,
+        }
+        _paged_attn_w_mma_kernel_unrolling4[grid](*kwargs, **const_kwargs)
+
+        if num_splits != 1:
+            assert (partition_size >= kv_block_size) and (
+                partition_size % kv_block_size == 0
+            ), f"partition_size={partition_size}, kv_block_size={kv_block_size}"
+            reduce_grid = (num_seqs, num_kv_heads, 1)
+            kwargs = [
+                out,
+                m_i,
+                l_i,
+                tmp_out,
+                context_lens,
+                num_splits,
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+            ]
+            const_kwargs = {
+                "HEAD_SIZE": head_size,
+                "QUERY_GROUP_SIZE": query_group_size,
+                "PADDED_QUERY_GROUP_SIZE": padded_group_size,
+                "NUM_KV_HEADS": num_kv_heads,
+                "PARTITION_SIZE": partition_size,
+                "NUM_PARTITIONS": triton.next_power_of_2(num_splits),
+            }
+            _paged_attn_w_mma_v2_reduce_kernel[reduce_grid](*kwargs, **const_kwargs)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=stages, num_warps=warps)
+        for stages in [0, 1]
+        for warps in [1, 2, 4, 8, 16]
+    ],
+    key=["QUERY_GROUP_SIZE", "HEAD_SIZE", "KV_BLOCK_SIZE"],
+)
+@triton.jit
+def _paged_attn_w_mma_kernel_unrolling4(
+    m_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
+    l_i_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE]
+    out_ptr,  # [num_seqs, NUM_KV_HEADS, max_num_partitions, QUERY_GROUP_SIZE, HEAD_SIZE]
+    q_ptr,  # [num_seqs, NUM_KV_HEADS * QUERY_GROUP_SIZE, HEAD_SIZE]
+    k_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    v_cache_ptr,  # [num_blocks, NUM_KV_HEADS, KV_BLOCK_SIZE, HEAD_SIZE]
+    context_lens_ptr,  # [num_seqs]
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    attn_scale,
+    stride_bt0,
+    stride_bt1,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_kv0,
+    stride_kv1,
+    stride_kv2,
+    stride_kv3,
+    stride_o0,
+    stride_o1,
+    stride_o2,
+    stride_o3,
+    stride_o4,
+    HEAD_SIZE: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    PADDED_QUERY_GROUP_SIZE: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+    PARTITION_SIZE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    kv_head_idx = tl.program_id(1)
+    part_idx = tl.program_id(2)
+    max_num_partitions = tl.num_programs(2)
+
+    # scale sm_scale by log_2(e) and use
+    # 2^x instead of exp in the loop because CSE and LICM
+    # don't work as expected with `exp` in the loop
+    log2e: tl.constexpr = 1.4426950408889634
+
+    USE_PARTITIONING = PARTITION_SIZE > 0
+    context_len = tl.load(context_lens_ptr + seq_idx)
+    if USE_PARTITIONING:
+        context_start_idx = part_idx * PARTITION_SIZE
+        if context_start_idx >= context_len:
+            return
+        context_end_idx = tl.minimum(context_start_idx + PARTITION_SIZE, context_len)
+        num_blocks = tl.cdiv(context_end_idx - context_start_idx, KV_BLOCK_SIZE)
+    else:
+        num_blocks = tl.cdiv(context_len, KV_BLOCK_SIZE)
+
+    block_offset = tl.arange(0, KV_BLOCK_SIZE)
+    head_offset = tl.arange(0, HEAD_SIZE)
+    padding_group_offset = tl.arange(0, PADDED_QUERY_GROUP_SIZE)
+
+    kv_offset = (
+        kv_head_idx * stride_kv1
+        + block_offset[:, None] * stride_kv2
+        + head_offset[None, :] * stride_kv3
+    )
+
+    # Load queries.
+    q_offset = (
+        seq_idx * stride_q0
+        + (kv_head_idx * QUERY_GROUP_SIZE + padding_group_offset[:, None]) * stride_q1
+        + head_offset[None, :] * stride_q2
+    )
+    group_mask = padding_group_offset[:, None] < QUERY_GROUP_SIZE
+    # q: [PADDED_QUERY_GROUP_SIZE, HEAD_SIZE]
+    q = tl.load(q_ptr + q_offset, mask=group_mask, other=0.0)
+    q = (q * attn_scale * log2e).to(q_ptr.dtype.element_ty)
+
+    m_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([PADDED_QUERY_GROUP_SIZE], dtype=tl.float32)
+    acc = tl.zeros([PADDED_QUERY_GROUP_SIZE, HEAD_SIZE], dtype=tl.float32)
+
+    num_prev_blocks = part_idx * (PARTITION_SIZE // KV_BLOCK_SIZE)
+    block_table_base = block_tables_ptr + seq_idx * stride_bt0
+    for i in range(0,num_blocks,4):
+        block_idx = num_prev_blocks + i
+        block_number = tl.load(
+            block_table_base + block_idx * stride_bt1
+        )
+        block_number1 = tl.load(
+            block_table_base + (block_idx + 1)* stride_bt1
+        )
+        block_number2 = tl.load(
+            block_table_base + (block_idx + 2)* stride_bt1
+        )
+        block_number3 = tl.load(
+            block_table_base + (block_idx + 3)* stride_bt1
+        )
+
+        # Load a key block.
+        kv_block_offset = block_number * stride_kv0 + kv_offset
+        kv_block_offset1 = block_number1 * stride_kv0 + kv_offset
+        kv_block_offset2 = block_number2 * stride_kv0 + kv_offset
+        kv_block_offset3 = block_number3 * stride_kv0 + kv_offset
+        mask_offset = block_idx * KV_BLOCK_SIZE + block_offset
+        mask_offset1 = (block_idx + 1) * KV_BLOCK_SIZE + block_offset
+        mask_offset2 = (block_idx + 2) * KV_BLOCK_SIZE + block_offset
+        mask_offset3 = (block_idx + 3) * KV_BLOCK_SIZE + block_offset
+        kv_mask = mask_offset[:, None] < context_len
+        kv_mask1 = mask_offset1[:, None] < context_len
+        kv_mask2 = mask_offset2[:, None] < context_len
+        kv_mask3 = mask_offset3[:, None] < context_len
+
+        # k: [KV_BLOCK_SIZE, HEAD_SIZE]
+        k = tl.load(k_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
+        k1 = tl.load(k_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
+        k2 = tl.load(k_cache_ptr + kv_block_offset2, mask=kv_mask2, other=0.0)
+        k3 = tl.load(k_cache_ptr + kv_block_offset3, mask=kv_mask3, other=0.0)
+
+        # qk: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        if PADDED_QUERY_GROUP_SIZE == 1:
+            qk = tl.sum(q[:, None, :] * k[None, :, :], axis=2)
+            qk1 = tl.sum(q[:, None, :] * k1[None, :, :], axis=2)
+            qk2 = tl.sum(q[:, None, :] * k2[None, :, :], axis=2)
+            qk3 = tl.sum(q[:, None, :] * k3[None, :, :], axis=2)
+        else:
+            qk = tl.dot(q, k.T, out_dtype=tl.float32)
+            qk1 = tl.dot(q, k1.T, out_dtype=tl.float32)
+            qk2 = tl.dot(q, k2.T, out_dtype=tl.float32)
+            qk3 = tl.dot(q, k3.T, out_dtype=tl.float32)
+
+        # qk *= attn_scale
+        qk = tl.where(mask_offset < context_len, qk, float("-inf"))
+        qk1 = tl.where(mask_offset1 < context_len, qk1, float("-inf"))
+        qk2 = tl.where(mask_offset2 < context_len, qk2, float("-inf"))
+        qk3 = tl.where(mask_offset3 < context_len, qk3, float("-inf"))
+
+        m_i_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        m_i_new = tl.maximum(m_i_new, tl.max(qk1, axis=1))
+        m_i_new = tl.maximum(m_i_new, tl.max(qk2, axis=1))
+        m_i_new = tl.maximum(m_i_new, tl.max(qk3, axis=1))
+
+        # p: [PADDED_QUERY_GROUP_SIZE, KV_BLOCK_SIZE]
+        p = tl.math.exp2((qk - m_i_new[:, None]))
+        p1 = tl.math.exp2((qk1 - m_i_new[:, None]))
+        p2 = tl.math.exp2((qk2 - m_i_new[:, None]))
+        p3 = tl.math.exp2((qk3 - m_i_new[:, None]))
+        alpha = tl.math.exp2((m_i - m_i_new))
         acc *= alpha[:, None]
 
         # v: [KV_BLOCK_SIZE, HEAD_SIZE]
         v = tl.load(v_cache_ptr + kv_block_offset, mask=kv_mask, other=0.0)
+        v1 = tl.load(v_cache_ptr + kv_block_offset1, mask=kv_mask1, other=0.0)
+        v2 = tl.load(v_cache_ptr + kv_block_offset2, mask=kv_mask2, other=0.0)
+        v3 = tl.load(v_cache_ptr + kv_block_offset3, mask=kv_mask3, other=0.0)
 
         if PADDED_QUERY_GROUP_SIZE == 1:
             acc += tl.sum(p.T[:, :, None] * v[:, None, :], axis=0)
+            acc += tl.sum(p1.T[:, :, None] * v1[:, None, :], axis=0)
+            acc += tl.sum(p2.T[:, :, None] * v2[:, None, :], axis=0)
+            acc += tl.sum(p3.T[:, :, None] * v3[:, None, :], axis=0)
         else:
             p = p.to(v.dtype)
+            p1 = p1.to(v.dtype)
+            p2 = p2.to(v.dtype)
+            p3 = p3.to(v.dtype)
             acc += tl.dot(p, v, out_dtype=tl.float32)
+            acc += tl.dot(p1, v1, out_dtype=tl.float32)
+            acc += tl.dot(p2, v2, out_dtype=tl.float32)
+            acc += tl.dot(p3, v3, out_dtype=tl.float32)
 
-        l_i = l_i * alpha + tl.sum(p, axis=1)
+        l_i = l_i * alpha + tl.sum(p + p1 + p2 + p3, axis=1)
         m_i = m_i_new
-    acc = acc / l_i[:, None]
+    l_recip = 1 / l_i
+    acc = acc * l_recip[:, None]
 
     if USE_PARTITIONING:
         part_offset = (
@@ -499,7 +1515,8 @@ def _paged_attn_w_mma_v2_reduce_kernel(
     # l: [PADDED_QUERY_GROUP_SIZE]
     l = tl.sum(l_i, axis=0)
     # r: [NUM_PARTITIONS, PADDED_QUERY_GROUP_SIZE]
-    r = l_i / l[None, :]
+    l_recip = 1 / l
+    r = l_i * l_recip[None, :]
     r = tl.reshape(r, (NUM_PARTITIONS, PADDED_QUERY_GROUP_SIZE, 1))
 
     tmp_out_offset = (
